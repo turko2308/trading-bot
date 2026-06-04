@@ -7,7 +7,7 @@ import os
 # ============================================================
 # הגדרות
 # ============================================================
-TELEGRAM_TOKEN = "8847434629:AAE6Kat_wgMFSUc4H70buunBoXyNON78k04"
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = "960197631"
 TWELVEDATA_KEY = "2be6ffca08d942de8903d6aee41a312e"
 
