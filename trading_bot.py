@@ -795,8 +795,8 @@ def main():
             if now.hour == 8 and now.minute < 6:
                 send_telegram(f"✅ בוט פעיל | סריקה #{scan_count} | {now.strftime('%d/%m/%Y')}")
 
-            print(f"ממתין 5 דקות...", flush=True)
-            time.sleep(300)
+            print(f"ממתין 15 דקות...", flush=True)
+            time.sleep(900)
 
         except Exception as e:
             print(f"שגיאה כללית: {e}", flush=True)
