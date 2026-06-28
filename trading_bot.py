@@ -30,7 +30,7 @@ RISK_PER_TRADE = 0.02        # 2%
 TRADE_TIMEOUT_HOURS = 6
 SIGNAL_COOLDOWN_MINUTES = 30
 
-DATA_FILE = "/home/claude/bot_data.json"
+DATA_FILE = DATA_FILE = "/tmp/bot_data.json"
 
 # ============================================================
 # שמירת מצב
