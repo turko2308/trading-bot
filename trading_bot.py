@@ -3,13 +3,14 @@ import time
 import datetime
 import json
 import os
+import sys
 
 # ============================================================
 # הגדרות
 # ============================================================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-CHAT_ID = "960197631"
-TWELVEDATA_KEY = "2be6ffca08d942de8903d6aee41a312e"
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "960197631")
+TWELVEDATA_KEY = os.environ.get("TWELVE_DATA_API_KEY", "2be6ffca08d942de8903d6aee41a312e")
 
 SYMBOLS = {
     "זהב": "XAU/USD",
@@ -22,24 +23,25 @@ TRADING_HOURS = {
     "נאסד\"ק": {"start": 16, "end": 23}
 }
 
-MAX_TRADES_PER_DAY = 3       # לכל נכס
-MAX_PARALLEL_TRADES = 2      # במקביל
-DAILY_LOSS_LIMIT = 30        # שקל
-ACCOUNT_SIZE = 500           # שקל
-RISK_PER_TRADE = 0.02        # 2%
+MAX_TRADES_PER_DAY = 3
+MAX_PARALLEL_TRADES = 2
+DAILY_LOSS_LIMIT = 30
+ACCOUNT_SIZE = 500
+RISK_PER_TRADE = 0.02
 TRADE_TIMEOUT_HOURS = 6
 SIGNAL_COOLDOWN_MINUTES = 30
 
 DATA_FILE = "/tmp/bot_data.json"
+
 # ============================================================
 # שמירת מצב
 # ============================================================
 def load_data():
     default = {
-        "trades": [],           # עסקאות פתוחות
-        "daily_stats": {},      # סטטיסטיקה יומית
-        "signal_history": [],   # היסטוריית סיגנלים
-        "indicator_weights": {  # משקל אינדיקטורים (למידה)
+        "trades": [],
+        "daily_stats": {},
+        "signal_history": [],
+        "indicator_weights": {
             "rsi": 1.0,
             "macd": 1.0,
             "bollinger": 1.0,
@@ -66,12 +68,13 @@ def save_data(data):
         with open(DATA_FILE, "w") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"שגיאה בשמירה: {e}")
+        print(f"שגיאה בשמירה: {e}", flush=True)
 
 # ============================================================
 # טלגרם
 # ============================================================
 def send_telegram(message, keyboard=None):
+    print(f"[TELEGRAM] שולח הודעה: {message[:60]}...", flush=True)
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID,
@@ -82,9 +85,11 @@ def send_telegram(message, keyboard=None):
         payload["reply_markup"] = {"inline_keyboard": keyboard}
     try:
         r = requests.post(url, json=payload, timeout=10)
-        return r.json().get("result", {}).get("message_id")
+        result = r.json()
+        print(f"[TELEGRAM] תגובה: {result}", flush=True)
+        return result.get("result", {}).get("message_id")
     except Exception as e:
-        print(f"שגיאה בטלגרם: {e}")
+        print(f"[TELEGRAM] שגיאה: {e}", flush=True)
         return None
 
 def get_updates(offset=0):
@@ -117,7 +122,7 @@ def get_prices(symbol, interval="15min", outputsize=50):
         r = requests.get(url, params=params, timeout=15)
         data = r.json()
         if "values" not in data:
-            print(f"שגיאה ב-{symbol}: {data.get('message', 'לא ידוע')}")
+            print(f"שגיאה ב-{symbol}: {data.get('message', 'לא ידוע')}", flush=True)
             return None
         closes = [float(v["close"]) for v in reversed(data["values"])]
         volumes = [float(v.get("volume", 0)) for v in reversed(data["values"])]
@@ -125,11 +130,10 @@ def get_prices(symbol, interval="15min", outputsize=50):
         lows = [float(v["low"]) for v in reversed(data["values"])]
         return {"closes": closes, "volumes": volumes, "highs": highs, "lows": lows}
     except Exception as e:
-        print(f"שגיאה בשליפת נתונים {symbol}: {e}")
+        print(f"שגיאה בשליפת נתונים {symbol}: {e}", flush=True)
         return None
 
 def get_daily_trend(symbol):
-    """מגמה ראשית - גרף יומי"""
     try:
         url = "https://api.twelvedata.com/time_series"
         params = {
@@ -154,7 +158,6 @@ def get_daily_trend(symbol):
         return None
 
 def get_news_sentiment(symbol_name):
-    """סנטימנט חדשות בסיסי"""
     try:
         query = "gold" if "זהב" in symbol_name else "nasdaq"
         url = f"https://api.twelvedata.com/news"
@@ -232,7 +235,7 @@ def calc_atr(highs, lows, closes, period=14):
 
 def check_breakout(prices, highs, lows, volumes, candles=20):
     if len(prices) < candles + 1:
-        return None
+        return None, False
     recent_highs = highs[-candles-1:-1]
     recent_lows = lows[-candles-1:-1]
     current = prices[-1]
@@ -261,22 +264,18 @@ def can_trade(symbol_name, data):
     today = get_today_key()
     daily = data["daily_stats"].get(today, {})
 
-    # בדיקת מגבלת עסקאות יומית לנכס
     symbol_trades = daily.get(f"trades_{symbol_name}", 0)
     if symbol_trades >= MAX_TRADES_PER_DAY:
         return False, f"הגעת למקסימום {MAX_TRADES_PER_DAY} איתותים היום על {symbol_name}"
 
-    # בדיקת עסקאות פתוחות במקביל
     open_trades = [t for t in data["trades"] if t["status"] == "open"]
     if len(open_trades) >= MAX_PARALLEL_TRADES:
         return False, "2 עסקאות פתוחות כבר"
 
-    # בדיקת הפסד יומי
     daily_pnl = daily.get("pnl", 0)
     if daily_pnl <= -DAILY_LOSS_LIMIT:
         return False, f"הגעת למגבלת ההפסד היומית ({DAILY_LOSS_LIMIT} ש\"ח)"
 
-    # בדיקת cooldown
     now = datetime.datetime.now()
     recent_signals = [
         s for s in data["signal_history"]
@@ -289,7 +288,6 @@ def can_trade(symbol_name, data):
     return True, ""
 
 def check_open_trades_for_symbol(symbol_name, data):
-    """בדוק אם יש עסקה פתוחה על הנכס הזה"""
     for t in data["trades"]:
         if t["symbol"] == symbol_name and t["status"] == "open":
             return t
@@ -300,11 +298,12 @@ def check_open_trades_for_symbol(symbol_name, data):
 # ============================================================
 def analyze_and_signal(symbol_name, symbol_code, data):
     if not is_trading_hours(symbol_name):
+        print(f"[{symbol_name}] לא בשעות מסחר", flush=True)
         return
 
     can, reason = can_trade(symbol_name, data)
     if not can:
-        print(f"[{symbol_name}] לא שולח: {reason}")
+        print(f"[{symbol_name}] לא שולח: {reason}", flush=True)
         return
 
     prices_data = get_prices(symbol_code)
@@ -317,7 +316,6 @@ def analyze_and_signal(symbol_name, symbol_code, data):
     volumes = prices_data["volumes"]
     current = closes[-1]
 
-    # אינדיקטורים
     rsi = calc_rsi(closes)
     macd_line, macd_signal = calc_macd(closes)
     bb_upper, bb_mid, bb_lower = calc_bollinger(closes)
@@ -331,7 +329,6 @@ def analyze_and_signal(symbol_name, symbol_code, data):
     direction = None
     score = 0
 
-    # RSI
     if rsi is not None:
         if rsi <= 30:
             signals.append(f"🔵 RSI = {rsi} (מכירת יתר)")
@@ -342,7 +339,6 @@ def analyze_and_signal(symbol_name, symbol_code, data):
             score += 1 * weights["rsi"]
             direction = "מכירה"
 
-    # MACD
     if macd_line is not None:
         if macd_line > macd_signal and (direction == "קנייה" or direction is None):
             signals.append(f"📈 MACD חיובי ({macd_line})")
@@ -355,7 +351,6 @@ def analyze_and_signal(symbol_name, symbol_code, data):
             if direction is None:
                 direction = "מכירה"
 
-    # Bollinger
     if bb_upper and bb_lower:
         if current <= bb_lower and (direction == "קנייה" or direction is None):
             signals.append(f"📊 מתחת לרצועה תחתונה ({bb_lower})")
@@ -368,7 +363,6 @@ def analyze_and_signal(symbol_name, symbol_code, data):
             if direction is None:
                 direction = "מכירה"
 
-    # פריצה
     if breakout_dir:
         vol_txt = "נפח גבוה ✅" if volume_strong else "נפח נמוך ⚠️"
         if breakout_dir == "למעלה" and (direction == "קנייה" or direction is None):
@@ -380,7 +374,6 @@ def analyze_and_signal(symbol_name, symbol_code, data):
             score += (1.5 if volume_strong else 0.5) * weights["breakout"]
             direction = "מכירה"
 
-    # מגמה ראשית
     trend_bonus = ""
     if daily_trend and direction:
         if (daily_trend == "עלייה" and direction == "קנייה"):
@@ -393,7 +386,6 @@ def analyze_and_signal(symbol_name, symbol_code, data):
             score -= 0.5
             trend_bonus = "⚠️ נגד המגמה"
 
-    # סנטימנט
     sent_note = ""
     if sentiment:
         if (sentiment == "חיובי 🟢" and direction == "קנייה") or \
@@ -404,22 +396,18 @@ def analyze_and_signal(symbol_name, symbol_code, data):
             score -= 0.3
             sent_note = f"📰 חדשות: {sentiment} ⚠️"
 
-    # ציון כוכבים
     stars = min(5, max(1, round(score)))
     star_display = "⭐" * stars
 
-    # שלח רק אם ציון 3+
     if not direction or stars < 3:
-        print(f"[{datetime.datetime.now().strftime('%H:%M')}] {symbol_name}: ציון {stars} — לא מספיק")
+        print(f"[{datetime.datetime.now().strftime('%H:%M')}] {symbol_name}: ציון {stars} — לא מספיק", flush=True)
         return
 
-    # בדוק היפוך
     open_trade = check_open_trades_for_symbol(symbol_name, data)
     reversal_warning = ""
     if open_trade and open_trade["direction"] != direction:
         reversal_warning = f"\n⚠️ <b>שים לב — היפוך כיוון!</b>\nהיית ב{open_trade['direction']} — עכשיו סיגנל {direction}\nשקול לסגור את העסקה הפתוחה!\n"
 
-    # חישוב סטופ וטארגט
     risk_amount = round(ACCOUNT_SIZE * RISK_PER_TRADE, 1)
     if atr:
         stop_distance = atr * 1.5
@@ -438,7 +426,6 @@ def analyze_and_signal(symbol_name, symbol_code, data):
     now = datetime.datetime.now()
     timeout_time = (now + datetime.timedelta(hours=TRADE_TIMEOUT_HOURS)).strftime("%H:%M")
 
-    # בנה הודעה
     trend_line = f"📈 מגמה ראשית: {daily_trend} {trend_bonus}\n" if daily_trend else ""
     sent_line = f"{sent_note}\n" if sent_note else ""
 
@@ -472,7 +459,6 @@ def analyze_and_signal(symbol_name, symbol_code, data):
 
     send_telegram(msg, keyboard)
 
-    # שמור היסטוריית סיגנל
     data["signal_history"].append({
         "symbol": symbol_name,
         "time": now.isoformat(),
@@ -480,11 +466,9 @@ def analyze_and_signal(symbol_name, symbol_code, data):
         "score": stars,
         "price": current
     })
-    # נקה היסטוריה ישנה
     cutoff = (now - datetime.timedelta(hours=2)).isoformat()
     data["signal_history"] = [s for s in data["signal_history"] if s["time"] > cutoff]
 
-    # עדכן ספירת איתותים יומית
     today = get_today_key()
     if today not in data["daily_stats"]:
         data["daily_stats"][today] = {}
@@ -492,7 +476,7 @@ def analyze_and_signal(symbol_name, symbol_code, data):
     data["daily_stats"][today][key] = data["daily_stats"][today].get(key, 0) + 1
 
     save_data(data)
-    print(f"[{now.strftime('%H:%M')}] איתות נשלח: {symbol_name} {direction} ציון {stars}")
+    print(f"[{now.strftime('%H:%M')}] איתות נשלח: {symbol_name} {direction} ציון {stars}", flush=True)
 
 # ============================================================
 # טיפול בתגובות משתמש
@@ -508,7 +492,6 @@ def handle_callbacks(data, last_update_id):
             cbd = cb["data"]
 
             if cbd.startswith("enter_"):
-                # משתמש נכנס לעסקה
                 parts = cbd.split("_")
                 symbol = parts[1]
                 direction = parts[3]
@@ -549,7 +532,6 @@ def handle_callbacks(data, last_update_id):
                 send_telegram("❌ דילגת על הסיגנל — ממשיך לסרוק 👀")
 
             elif cbd.startswith("close_"):
-                # משתמש סגר עסקה
                 trade_id = "_".join(cbd.split("_")[1:])
                 keyboard = [
                     [{"text": "🎯 הגעתי לטארגט המלא", "callback_data": f"result_full_{trade_id}"}],
@@ -563,7 +545,6 @@ def handle_callbacks(data, last_update_id):
                 result_type = parts[1]
                 trade_id = "_".join(parts[2:])
 
-                # מצא עסקה
                 trade = next((t for t in data["trades"] if t["id"] == trade_id and t["status"] == "open"), None)
                 if not trade:
                     send_telegram("⚠️ לא נמצאה עסקה פתוחה")
@@ -583,10 +564,7 @@ def handle_callbacks(data, last_update_id):
                     send_telegram(f"🎉 <b>עסקה סגורה — רווח!</b>\n💰 +{round(pnl,2)} נקודות")
 
                 elif result_type == "early":
-                    send_telegram(
-                        "💰 <b>כמה עשית?</b>\n"
-                        "שלח לי את הסכום בש\"ח (לדוגמה: 45)"
-                    )
+                    send_telegram("💰 <b>כמה עשית?</b>\nשלח לי את הסכום בש\"ח (לדוגמה: 45)")
                     trade["waiting_early_exit"] = True
 
                 elif result_type == "loss":
@@ -606,7 +584,6 @@ def handle_callbacks(data, last_update_id):
             msg = update["message"]
             text = msg.get("text", "").strip()
 
-            # טיפול בתשובת יציאה מוקדמת
             waiting_trade = next((t for t in data["trades"] if t.get("waiting_early_exit") and t["status"] == "open"), None)
             if waiting_trade and text.replace(".", "").isdigit():
                 amount = float(text)
@@ -651,7 +628,6 @@ def monitor_open_trades(data):
         if not symbol_code:
             continue
 
-        # שליפת מחיר נוכחי (עם cache)
         if symbol_code not in prices_cache:
             pd = get_prices(symbol_code, outputsize=5)
             if pd:
@@ -662,10 +638,8 @@ def monitor_open_trades(data):
 
         entry = trade["entry"]
         stop = trade["stop"]
-        target1 = trade["target1"]
         direction = trade["direction"]
 
-        # Trailing Stop
         if direction == "קנייה":
             profit = current_price - entry
             if profit > 0:
@@ -673,7 +647,6 @@ def monitor_open_trades(data):
                 if new_stop > trade["trailing_stop"]:
                     trade["trailing_stop"] = new_stop
 
-            # התראה קרוב לסטופ
             distance_to_stop = current_price - stop
             total_range = entry - stop
             if total_range > 0 and distance_to_stop / total_range < 0.2:
@@ -684,7 +657,7 @@ def monitor_open_trades(data):
                     f"מרחק: {round(distance_to_stop, 2)}"
                 )
 
-        else:  # מכירה
+        else:
             profit = entry - current_price
             if profit > 0:
                 new_stop = round(current_price + (entry - current_price) * 0.5, 2)
@@ -701,7 +674,6 @@ def monitor_open_trades(data):
                     f"מרחק: {round(distance_to_stop, 2)}"
                 )
 
-        # תזכורת timeout
         timeout = datetime.datetime.fromisoformat(trade["timeout"])
         if now >= timeout and not trade.get("timeout_sent"):
             trade["timeout_sent"] = True
@@ -718,16 +690,15 @@ def monitor_open_trades(data):
     save_data(data)
 
 # ============================================================
-# למידה — עדכון משקל אינדיקטורים
+# למידה
 # ============================================================
 def update_indicator_weights(data):
     stats = data["all_time_stats"]
     total = stats["total_trades"]
     if total < 20:
-        return  # צריך מינימום 20 עסקאות
+        return
 
     win_rate = stats["wins"] / total
-    # לוגיקה פשוטה: אם אחוז הצלחה נמוך — הקטן משקל breakout
     if win_rate < 0.45:
         data["indicator_weights"]["breakout"] = max(0.5, data["indicator_weights"]["breakout"] - 0.1)
         data["indicator_weights"]["rsi"] = min(1.5, data["indicator_weights"]["rsi"] + 0.1)
@@ -771,13 +742,15 @@ def send_daily_report(data):
 # לולאה ראשית
 # ============================================================
 def main():
-    import sys
     print("🤖 בוט מסחר מופעל!", flush=True)
     print(f"TELEGRAM_TOKEN exists: {bool(TELEGRAM_TOKEN)}", flush=True)
+    print(f"CHAT_ID: {CHAT_ID}", flush=True)
     print(f"Python version: {sys.version}", flush=True)
+
     data = load_data()
     print("Data loaded OK", flush=True)
 
+    print("שולח הודעת הפעלה לטלגרם...", flush=True)
     send_telegram(
         "🤖 <b>בוט המסחר הופעל!</b>\n\n"
         "📊 סורק: זהב + נאסד\"ק\n"
@@ -787,6 +760,7 @@ def main():
         "🥇 זהב: 10:00—22:00\n"
         "💻 נאסד\"ק: 16:00—23:00"
     )
+    print("הודעת הפעלה נשלחה!", flush=True)
 
     last_update_id = 0
     last_daily_report = ""
@@ -796,13 +770,11 @@ def main():
         try:
             now = datetime.datetime.now()
 
-            # טיפול בתגובות משתמש
             last_update_id = handle_callbacks(data, last_update_id)
             data = load_data()
 
-            # סריקה
             scan_count += 1
-            print(f"\n--- סריקה #{scan_count} {now.strftime('%H:%M:%S')} ---")
+            print(f"\n--- סריקה #{scan_count} {now.strftime('%H:%M:%S')} ---", flush=True)
 
             for name, code in SYMBOLS.items():
                 try:
@@ -810,27 +782,24 @@ def main():
                     data = load_data()
                     time.sleep(3)
                 except Exception as e:
-                    print(f"שגיאה ב{name}: {e}")
+                    print(f"שגיאה ב{name}: {e}", flush=True)
 
-            # מעקב עסקאות פתוחות
             monitor_open_trades(data)
             data = load_data()
 
-            # דוח יומי בשעה 22:00
             today_key = now.strftime("%Y-%m-%d")
             if now.hour == 22 and now.minute < 6 and last_daily_report != today_key:
                 send_daily_report(data)
                 last_daily_report = today_key
 
-            # Watchdog — הודעת חיים בשעה 08:00
             if now.hour == 8 and now.minute < 6:
                 send_telegram(f"✅ בוט פעיל | סריקה #{scan_count} | {now.strftime('%d/%m/%Y')}")
 
-            print(f"ממתין 5 דקות...")
+            print(f"ממתין 5 דקות...", flush=True)
             time.sleep(300)
 
         except Exception as e:
-            print(f"שגיאה כללית: {e}")
+            print(f"שגיאה כללית: {e}", flush=True)
             try:
                 send_telegram(f"⚠️ שגיאה בבוט: {e}\nמנסה שוב...")
             except:
