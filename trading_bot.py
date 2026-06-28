@@ -771,8 +771,12 @@ def send_daily_report(data):
 # לולאה ראשית
 # ============================================================
 def main():
-    print("🤖 בוט מסחר מופעל!")
+    import sys
+    print("🤖 בוט מסחר מופעל!", flush=True)
+    print(f"TELEGRAM_TOKEN exists: {bool(TELEGRAM_TOKEN)}", flush=True)
+    print(f"Python version: {sys.version}", flush=True)
     data = load_data()
+    print("Data loaded OK", flush=True)
 
     send_telegram(
         "🤖 <b>בוט המסחר הופעל!</b>\n\n"
