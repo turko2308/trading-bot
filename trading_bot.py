@@ -15,7 +15,7 @@ TWELVEDATA_KEY = os.environ.get("TWELVE_DATA_API_KEY", "2be6ffca08d942de8903d6ae
 
 SYMBOLS = {
     "זהב": "XAU/USD",
-    'נאסד"ק': "QQQ"
+    'נאסד"ק': "US100"
 }
 
 # שעות מסחר (שעון ישראל)
