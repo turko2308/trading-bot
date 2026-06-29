@@ -23,8 +23,8 @@ SYMBOLS = {
 }
 
 TRADING_HOURS = {
-    "זהב": {"start": 10, "end": 22},
-    "כסף": {"start": 10, "end": 22}
+    "זהב": {"start": 10, "end": 23},
+    "כסף": {"start": 10, "end": 23}
 }
 
 MAX_TRADES_PER_DAY = 3
