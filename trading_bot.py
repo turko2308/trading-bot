@@ -4,6 +4,7 @@ import datetime
 import json
 import os
 import sys
+import hashlib
 
 # ============================================================
 # הגדרות
@@ -14,13 +15,13 @@ TWELVEDATA_KEY = os.environ.get("TWELVE_DATA_API_KEY", "2be6ffca08d942de8903d6ae
 
 SYMBOLS = {
     "זהב": "XAU/USD",
-    "נאסד\"ק": "NDX"
+    'נאסד"ק': "QQQ"
 }
 
 # שעות מסחר (שעון ישראל)
 TRADING_HOURS = {
     "זהב":    {"start": 10, "end": 22},
-    "נאסד\"ק": {"start": 16, "end": 23}
+    'נאסד"ק': {"start": 16, "end": 23}
 }
 
 MAX_TRADES_PER_DAY = 3
@@ -32,6 +33,7 @@ TRADE_TIMEOUT_HOURS = 6
 SIGNAL_COOLDOWN_MINUTES = 30
 
 DATA_FILE = "/tmp/bot_data.json"
+PENDING_FILE = "/tmp/pending_signals.json"
 
 # ============================================================
 # שמירת מצב
@@ -70,11 +72,31 @@ def save_data(data):
     except Exception as e:
         print(f"שגיאה בשמירה: {e}", flush=True)
 
+def load_pending():
+    try:
+        if os.path.exists(PENDING_FILE):
+            with open(PENDING_FILE, "r") as f:
+                return json.load(f)
+    except:
+        pass
+    return {}
+
+def save_pending(pending):
+    try:
+        with open(PENDING_FILE, "w") as f:
+            json.dump(pending, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"שגיאה בשמירת pending: {e}", flush=True)
+
+def make_trade_id(symbol_name, ts):
+    raw = f"{symbol_name}_{ts}"
+    return hashlib.md5(raw.encode()).hexdigest()[:8]
+
 # ============================================================
 # טלגרם
 # ============================================================
 def send_telegram(message, keyboard=None):
-    print(f"[TELEGRAM] שולח הודעה: {message[:60]}...", flush=True)
+    print(f"[TELEGRAM] שולח: {message[:60]}...", flush=True)
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": CHAT_ID,
@@ -160,7 +182,7 @@ def get_daily_trend(symbol):
 def get_news_sentiment(symbol_name):
     try:
         query = "gold" if "זהב" in symbol_name else "nasdaq"
-        url = f"https://api.twelvedata.com/news"
+        url = "https://api.twelvedata.com/news"
         params = {"symbol": query, "apikey": TWELVEDATA_KEY}
         r = requests.get(url, params=params, timeout=10)
         data = r.json()
@@ -242,7 +264,6 @@ def check_breakout(prices, highs, lows, volumes, candles=20):
     curr_volume = volumes[-1] if volumes[-1] > 0 else 1
     avg_volume = sum(volumes[-candles:]) / candles if candles <= len(volumes) else 1
     volume_strong = curr_volume > avg_volume * 1.2
-
     if current > max(recent_highs):
         return "למעלה", volume_strong
     elif current < min(recent_lows):
@@ -274,7 +295,7 @@ def can_trade(symbol_name, data):
 
     daily_pnl = daily.get("pnl", 0)
     if daily_pnl <= -DAILY_LOSS_LIMIT:
-        return False, f"הגעת למגבלת ההפסד היומית ({DAILY_LOSS_LIMIT} ש\"ח)"
+        return False, f'הגעת למגבלת ההפסד היומית ({DAILY_LOSS_LIMIT} ש"ח)'
 
     now = datetime.datetime.now()
     recent_signals = [
@@ -376,10 +397,10 @@ def analyze_and_signal(symbol_name, symbol_code, data):
 
     trend_bonus = ""
     if daily_trend and direction:
-        if (daily_trend == "עלייה" and direction == "קנייה"):
+        if daily_trend == "עלייה" and direction == "קנייה":
             score += 0.5
             trend_bonus = "✅ עם המגמה"
-        elif (daily_trend == "ירידה" and direction == "מכירה"):
+        elif daily_trend == "ירידה" and direction == "מכירה":
             score += 0.5
             trend_bonus = "✅ עם המגמה"
         elif daily_trend != "ניטרלי":
@@ -426,6 +447,23 @@ def analyze_and_signal(symbol_name, symbol_code, data):
     now = datetime.datetime.now()
     timeout_time = (now + datetime.timedelta(hours=TRADE_TIMEOUT_HOURS)).strftime("%H:%M")
 
+    # שמור פרטי עסקה בקובץ pending עם ID קצר
+    trade_id = make_trade_id(symbol_name, now.strftime('%H%M%S'))
+    pending = load_pending()
+    pending[trade_id] = {
+        "symbol": symbol_name,
+        "direction": direction,
+        "entry": current,
+        "stop": stop,
+        "target1": target1,
+        "target2": target2,
+        "time": now.isoformat()
+    }
+    # נקה pending ישן (מעל שעה)
+    cutoff = (now - datetime.timedelta(hours=1)).isoformat()
+    pending = {k: v for k, v in pending.items() if v["time"] > cutoff}
+    save_pending(pending)
+
     trend_line = f"📈 מגמה ראשית: {daily_trend} {trend_bonus}\n" if daily_trend else ""
     sent_line = f"{sent_note}\n" if sent_note else ""
 
@@ -437,10 +475,10 @@ def analyze_and_signal(symbol_name, symbol_code, data):
         f"━━━━━━━━━━━━━━━\n"
         f"📊 כיוון: <b>{'קנייה 🟢' if direction == 'קנייה' else 'מכירה 🔴'}</b>\n"
         f"💰 מחיר כניסה: <b>{current}</b>\n"
-        f"🛑 סטופ לוס: <b>{stop}</b> (ATR)\n"
+        f'🛑 סטופ לוס: <b>{stop}</b> (ATR)\n'
         f"🎯 טארגט 1: <b>{target1}</b> (צא חצי)\n"
         f"🎯 טארגט 2: <b>{target2}</b> (יציאה מלאה)\n"
-        f"💸 סיכון: {risk_amount} ש\"ח\n"
+        f'💸 סיכון: {risk_amount} ש"ח\n'
         f"━━━━━━━━━━━━━━━\n"
         f"{trend_line}"
         f"{sent_line}"
@@ -451,10 +489,10 @@ def analyze_and_signal(symbol_name, symbol_code, data):
         f"⚠️ לא המלצה פיננסית — תחליט לבד!"
     )
 
-    signal_id = f"{symbol_name}_{now.strftime('%H%M%S')}"
+    # callback_data קצר — מקסימום ~20 bytes
     keyboard = [[
-        {"text": "✅ נכנסתי לעסקה", "callback_data": f"enter_{signal_id}_{direction}_{current}_{stop}_{target1}_{target2}"},
-        {"text": "❌ דילגתי", "callback_data": f"skip_{signal_id}"}
+        {"text": "✅ נכנסתי", "callback_data": f"en_{trade_id}"},
+        {"text": "❌ דילגתי", "callback_data": f"sk_{trade_id}"}
     ]]
 
     send_telegram(msg, keyboard)
@@ -466,8 +504,8 @@ def analyze_and_signal(symbol_name, symbol_code, data):
         "score": stars,
         "price": current
     })
-    cutoff = (now - datetime.timedelta(hours=2)).isoformat()
-    data["signal_history"] = [s for s in data["signal_history"] if s["time"] > cutoff]
+    cutoff2 = (now - datetime.timedelta(hours=2)).isoformat()
+    data["signal_history"] = [s for s in data["signal_history"] if s["time"] > cutoff2]
 
     today = get_today_key()
     if today not in data["daily_stats"]:
@@ -490,60 +528,58 @@ def handle_callbacks(data, last_update_id):
             cb = update["callback_query"]
             answer_callback(cb["id"])
             cbd = cb["data"]
+            pending = load_pending()
 
-            if cbd.startswith("enter_"):
-                parts = cbd.split("_")
-                symbol = parts[1]
-                direction = parts[3]
-                entry = float(parts[4])
-                stop = float(parts[5])
-                target1 = float(parts[6])
-                target2 = float(parts[7]) if len(parts) > 7 else float(parts[6])
+            if cbd.startswith("en_"):
+                trade_id = cbd[3:]
+                signal = pending.get(trade_id)
+                if not signal:
+                    send_telegram("⚠️ הסיגנל פג תוקף")
+                    continue
+
                 now = datetime.datetime.now()
                 timeout = (now + datetime.timedelta(hours=TRADE_TIMEOUT_HOURS)).isoformat()
-
                 trade = {
-                    "id": cbd,
-                    "symbol": symbol,
-                    "direction": direction,
-                    "entry": entry,
-                    "stop": stop,
-                    "target1": target1,
-                    "target2": target2,
+                    "id": trade_id,
+                    "symbol": signal["symbol"],
+                    "direction": signal["direction"],
+                    "entry": signal["entry"],
+                    "stop": signal["stop"],
+                    "target1": signal["target1"],
+                    "target2": signal["target2"],
                     "entry_time": now.isoformat(),
                     "timeout": timeout,
                     "status": "open",
-                    "trailing_stop": stop
+                    "trailing_stop": signal["stop"]
                 }
                 data["trades"].append(trade)
                 save_data(data)
 
-                keyboard = [[{"text": "🔒 סגרתי עסקה", "callback_data": f"close_{cbd}"}]]
+                keyboard = [[{"text": "🔒 סגרתי עסקה", "callback_data": f"cl_{trade_id}"}]]
                 send_telegram(
-                    f"✅ <b>עסקה נפתחה — {symbol}</b>\n"
-                    f"כיוון: {'קנייה 🟢' if direction == 'קנייה' else 'מכירה 🔴'}\n"
-                    f"כניסה: {entry}\n"
-                    f"סטופ: {stop}\n"
+                    f"✅ <b>עסקה נפתחה — {signal['symbol']}</b>\n"
+                    f"כיוון: {'קנייה 🟢' if signal['direction'] == 'קנייה' else 'מכירה 🔴'}\n"
+                    f"כניסה: {signal['entry']}\n"
+                    f"סטופ: {signal['stop']}\n"
                     f"⏰ תזכורת יציאה: {datetime.datetime.fromisoformat(timeout).strftime('%H:%M')}",
                     keyboard
                 )
 
-            elif cbd.startswith("skip_"):
+            elif cbd.startswith("sk_"):
                 send_telegram("❌ דילגת על הסיגנל — ממשיך לסרוק 👀")
 
-            elif cbd.startswith("close_"):
-                trade_id = "_".join(cbd.split("_")[1:])
+            elif cbd.startswith("cl_"):
+                trade_id = cbd[3:]
                 keyboard = [
-                    [{"text": "🎯 הגעתי לטארגט המלא", "callback_data": f"result_full_{trade_id}"}],
-                    [{"text": "💰 יצאתי מוקדם — הכנס סכום", "callback_data": f"result_early_{trade_id}"}],
-                    [{"text": "❌ יצאתי בהפסד", "callback_data": f"result_loss_{trade_id}"}]
+                    [{"text": "🎯 הגעתי לטארגט", "callback_data": f"rf_{trade_id}"}],
+                    [{"text": "💰 יצאתי מוקדם", "callback_data": f"re_{trade_id}"}],
+                    [{"text": "❌ יצאתי בהפסד", "callback_data": f"rl_{trade_id}"}]
                 ]
                 send_telegram("📊 <b>איך יצאת מהעסקה?</b>", keyboard)
 
-            elif cbd.startswith("result_"):
-                parts = cbd.split("_")
-                result_type = parts[1]
-                trade_id = "_".join(parts[2:])
+            elif cbd.startswith("rf_") or cbd.startswith("re_") or cbd.startswith("rl_"):
+                result_type = cbd[:2]
+                trade_id = cbd[3:]
 
                 trade = next((t for t in data["trades"] if t["id"] == trade_id and t["status"] == "open"), None)
                 if not trade:
@@ -554,7 +590,7 @@ def handle_callbacks(data, last_update_id):
                 if today not in data["daily_stats"]:
                     data["daily_stats"][today] = {}
 
-                if result_type == "full":
+                if result_type == "rf":
                     pnl = abs(trade["target2"] - trade["entry"])
                     data["all_time_stats"]["wins"] += 1
                     data["daily_stats"][today]["pnl"] = data["daily_stats"][today].get("pnl", 0) + pnl
@@ -563,22 +599,23 @@ def handle_callbacks(data, last_update_id):
                     trade["pnl"] = pnl
                     send_telegram(f"🎉 <b>עסקה סגורה — רווח!</b>\n💰 +{round(pnl,2)} נקודות")
 
-                elif result_type == "early":
-                    send_telegram("💰 <b>כמה עשית?</b>\nשלח לי את הסכום בש\"ח (לדוגמה: 45)")
+                elif result_type == "re":
+                    send_telegram('💰 <b>כמה עשית?</b>\nשלח לי את הסכום בש"ח (לדוגמה: 45)')
                     trade["waiting_early_exit"] = True
 
-                elif result_type == "loss":
+                elif result_type == "rl":
                     risk = ACCOUNT_SIZE * RISK_PER_TRADE
                     data["all_time_stats"]["losses"] += 1
                     data["daily_stats"][today]["pnl"] = data["daily_stats"][today].get("pnl", 0) - risk
                     trade["status"] = "closed"
                     trade["result"] = "loss"
                     trade["pnl"] = -risk
-                    send_telegram(f"📉 <b>עסקה סגורה — הפסד</b>\n💸 -{round(risk,2)} ש\"ח")
+                    send_telegram(f'📉 <b>עסקה סגורה — הפסד</b>\n💸 -{round(risk,2)} ש"ח')
 
-                data["all_time_stats"]["total_trades"] += 1
-                save_data(data)
-                update_indicator_weights(data)
+                if result_type != "re":
+                    data["all_time_stats"]["total_trades"] += 1
+                    save_data(data)
+                    update_indicator_weights(data)
 
         elif "message" in update:
             msg = update["message"]
@@ -600,13 +637,14 @@ def handle_callbacks(data, last_update_id):
                 waiting_trade.pop("waiting_early_exit", None)
                 data["all_time_stats"]["wins"] += 1
                 data["all_time_stats"]["early_exits"] += 1
+                data["all_time_stats"]["total_trades"] += 1
 
                 send_telegram(
                     f"✅ <b>עסקה סגורה — יציאה מוקדמת</b>\n"
-                    f"💰 רווח: {amount} ש\"ח\n"
+                    f'💰 רווח: {amount} ש"ח\n'
                     f"🎯 טארגט היה: {round(target_amount,2)} נקודות\n"
                     f"📊 יעילות: {efficiency}%\n"
-                    + (f"💡 השארת כסף על השולחן — שקול לתת לעסקאות לרוץ יותר" if efficiency < 60 else "")
+                    + ("💡 השארת כסף על השולחן — שקול לתת לעסקאות לרוץ יותר" if efficiency < 60 else "")
                 )
                 save_data(data)
 
@@ -646,7 +684,6 @@ def monitor_open_trades(data):
                 new_stop = round(current_price - (current_price - entry) * 0.5, 2)
                 if new_stop > trade["trailing_stop"]:
                     trade["trailing_stop"] = new_stop
-
             distance_to_stop = current_price - stop
             total_range = entry - stop
             if total_range > 0 and distance_to_stop / total_range < 0.2:
@@ -656,14 +693,12 @@ def monitor_open_trades(data):
                     f"סטופ לוס: {stop}\n"
                     f"מרחק: {round(distance_to_stop, 2)}"
                 )
-
         else:
             profit = entry - current_price
             if profit > 0:
                 new_stop = round(current_price + (entry - current_price) * 0.5, 2)
                 if new_stop < trade["trailing_stop"]:
                     trade["trailing_stop"] = new_stop
-
             distance_to_stop = stop - current_price
             total_range = stop - entry
             if total_range > 0 and distance_to_stop / total_range < 0.2:
@@ -677,7 +712,7 @@ def monitor_open_trades(data):
         timeout = datetime.datetime.fromisoformat(trade["timeout"])
         if now >= timeout and not trade.get("timeout_sent"):
             trade["timeout_sent"] = True
-            keyboard = [[{"text": "🔒 סגרתי עסקה", "callback_data": f"close_{trade['id']}"}]]
+            keyboard = [[{"text": "🔒 סגרתי עסקה", "callback_data": f"cl_{trade['id']}"}]]
             send_telegram(
                 f"⏰ <b>תזכורת — {symbol_name}</b>\n"
                 f"העסקה פתוחה כבר {TRADE_TIMEOUT_HOURS} שעות!\n"
@@ -697,7 +732,6 @@ def update_indicator_weights(data):
     total = stats["total_trades"]
     if total < 20:
         return
-
     win_rate = stats["wins"] / total
     if win_rate < 0.45:
         data["indicator_weights"]["breakout"] = max(0.5, data["indicator_weights"]["breakout"] - 0.1)
@@ -705,7 +739,6 @@ def update_indicator_weights(data):
         send_telegram(f"🧠 <b>הבוט למד ועדכן משקלים</b>\nRSI חוזק, Breakout הוחלש\nאחוז הצלחה: {round(win_rate*100)}%")
     elif win_rate > 0.65:
         data["indicator_weights"]["breakout"] = min(1.5, data["indicator_weights"]["breakout"] + 0.05)
-
     save_data(data)
 
 # ============================================================
@@ -725,7 +758,7 @@ def send_daily_report(data):
         f"🔔 איתותים היום: {total_today}\n"
         f"💰 רווח/הפסד היום: {round(pnl_today, 2)} נקודות\n\n"
         f"📈 <b>סטטיסטיקה כוללת:</b>\n"
-        f"  סה\"כ עסקאות: {stats['total_trades']}\n"
+        f'  סה"כ עסקאות: {stats["total_trades"]}\n'
         f"  ✅ רווחים: {stats['wins']}\n"
         f"  ❌ הפסדים: {stats['losses']}\n"
         f"  🏃 יציאות מוקדמות: {stats['early_exits']}\n"
@@ -750,11 +783,10 @@ def main():
     data = load_data()
     print("Data loaded OK", flush=True)
 
-    print("שולח הודעת הפעלה לטלגרם...", flush=True)
     send_telegram(
         "🤖 <b>בוט המסחר הופעל!</b>\n\n"
         "📊 סורק: זהב + נאסד\"ק\n"
-        "⏰ כל 5 דקות\n"
+        "⏰ כל 15 דקות\n"
         "📱 התראות לטלגרם\n\n"
         "שעות פעילות (ישראל):\n"
         "🥇 זהב: 10:00—22:00\n"
