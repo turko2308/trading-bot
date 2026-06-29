@@ -13,14 +13,18 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "960197631")
 TWELVEDATA_KEY = os.environ.get("TWELVE_DATA_API_KEY", "2be6ffca08d942de8903d6aee41a312e")
 
+# ⬇️ שינוי: נפט (WTI) הוחלף בכסף (XAG/USD).
+# הסמל "WTI" החזיר מניה (W&T Offshore), והסמל הנכון WTI/USD לא זמין בחינמי.
+# כסף הוא מתכת כמו זהב, זמין בחינמי, ונסחר ב-Plus500.
+# רוצה אחר? החלף את "XAG/USD" ל-"EUR/USD" או "BTC/USD" (שניהם חינמיים + ב-Plus500).
 SYMBOLS = {
     "זהב": "XAU/USD",
-    "נפט": "WTI"
+    "כסף": "XAG/USD"
 }
 
 TRADING_HOURS = {
     "זהב": {"start": 10, "end": 22},
-    "נפט": {"start": 10, "end": 22}
+    "כסף": {"start": 10, "end": 22}
 }
 
 MAX_TRADES_PER_DAY = 3
@@ -733,47 +737,63 @@ def main():
     data = load_data()
     send_telegram(
         "🤖 <b>בוט המסחר הופעל!</b>\n\n"
-        "📊 סורק: זהב + נפט\n"
+        "📊 סורק: זהב + כסף\n"
         "⏰ כל 15 דקות\n\n"
         "שעות פעילות (ישראל):\n"
         "🥇 זהב: 10:00—22:00\n"
-        "🛢️ נפט: 10:00—22:00"
+        "🥈 כסף: 10:00—22:00"
     )
 
     last_update_id = 0
     last_daily_report = ""
+    last_morning_ping = ""
     scan_count = 0
+
+    # ⬇️ התיקון המרכזי: הפרדה בין בדיקת כפתורים לסריקת שוק.
+    # הכפתורים נבדקים כל POLL_INTERVAL שניות → מגיבים מיד.
+    # סריקת השוק רצה כל SCAN_INTERVAL שניות → צריכת API נשארת זהה (כל 15 דק').
+    SCAN_INTERVAL = 900   # 15 דקות בין סריקות שוק
+    POLL_INTERVAL = 2     # תדירות בדיקת כפתורים (שניות)
+    last_scan_time = 0    # 0 → סריקה ראשונה מתבצעת מיד עם העלייה
 
     while True:
         try:
             now = datetime.datetime.now()
+
+            # --- בדיקת כפתורים (רץ כל ~2 שניות, getUpdates עם long-poll של 5 שניות) ---
             last_update_id = handle_callbacks(data, last_update_id)
             data = load_data()
 
-            scan_count += 1
-            print(f"\n--- סריקה #{scan_count} {now.strftime('%H:%M:%S')} ---", flush=True)
+            # --- סריקת שוק: רק כל 15 דקות ---
+            if time.time() - last_scan_time >= SCAN_INTERVAL:
+                last_scan_time = time.time()
+                scan_count += 1
+                print(f"\n--- סריקה #{scan_count} {now.strftime('%H:%M:%S')} ---", flush=True)
 
-            for name, code in SYMBOLS.items():
-                try:
-                    analyze_and_signal(name, code, data)
-                    data = load_data()
-                    time.sleep(3)
-                except Exception as e:
-                    print(f"שגיאה ב{name}: {e}", flush=True)
+                for name, code in SYMBOLS.items():
+                    try:
+                        analyze_and_signal(name, code, data)
+                        data = load_data()
+                        time.sleep(3)
+                    except Exception as e:
+                        print(f"שגיאה ב{name}: {e}", flush=True)
 
-            monitor_open_trades(data)
-            data = load_data()
+                monitor_open_trades(data)
+                data = load_data()
+                print("סריקה הסתיימה — כפתורים ממשיכים לעבוד עד הסריקה הבאה.", flush=True)
 
+            # --- דוח יומי (פעם אחת ביום) ---
             today_key = now.strftime("%Y-%m-%d")
             if now.hour == 22 and now.minute < 6 and last_daily_report != today_key:
                 send_daily_report(data)
                 last_daily_report = today_key
 
-            if now.hour == 8 and now.minute < 6:
+            # --- פינג בוקר (פעם אחת ביום — עם נעילה כדי שלא יישלח שוב ושוב) ---
+            if now.hour == 8 and now.minute < 6 and last_morning_ping != today_key:
                 send_telegram(f"✅ בוט פעיל | סריקה #{scan_count} | {now.strftime('%d/%m/%Y')}")
+                last_morning_ping = today_key
 
-            print("ממתין 15 דקות...", flush=True)
-            time.sleep(900)
+            time.sleep(POLL_INTERVAL)
 
         except Exception as e:
             print(f"שגיאה כללית: {e}", flush=True)
@@ -781,7 +801,7 @@ def main():
                 send_telegram(f"⚠️ שגיאה: {e}")
             except:
                 pass
-            time.sleep(60)
+            time.sleep(30)
 
 if __name__ == "__main__":
     main()
