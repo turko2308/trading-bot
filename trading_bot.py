@@ -399,7 +399,7 @@ def analyze_and_signal(symbol_name, symbol_code, data):
     stars = min(5, max(1, round(score)))
     star_display = "⭐" * stars
 
-    if not direction or stars < 3:
+    if not direction or stars < 2:
         print(f"[{datetime.datetime.now().strftime('%H:%M')}] {symbol_name}: ציון {stars} — לא מספיק", flush=True)
         return
 
