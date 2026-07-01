@@ -34,12 +34,32 @@ TRADE_TIMEOUT_HOURS = 6
 # מגבלת הפסד יומית — מנוטרלת לבינתיים (לשלב בדיקות)
 DAILY_LOSS_LIMIT = None
 
+# Circuit breaker — אחרי כמה הפסדים רצופים ביום עוצרים איתותים חדשים
+CONSECUTIVE_LOSS_LIMIT = 3
+
 ACCOUNT_SIZE = 500
 RISK_PER_TRADE = 0.02   # לתצוגה/השוואה בלבד — אינו משמש לחישוב הרווח/הפסד
 
 # ============================================================
+# פילטר מגמה קשה (Hard trend filter)
+# EMA50 על נרות שעה. קובע איזה כיוון בכלל מותר לפתוח.
+# מחיר מעל ה-EMA ביותר מ-0.3% → רק לונג. מתחת ל-0.3% → רק שורט.
+# באמצע (דשדוש) → אין איתותים בכלל.
+# ============================================================
+TREND_INTERVAL = "1h"
+TREND_EMA_PERIOD = 50
+TREND_DEADZONE = 0.003          # ±0.3% סביב ה-EMA = דשדוש
+TREND_CACHE_MINUTES = 30        # מטמון — לחסוך קריאות API (ה-1h לא זז מהר)
+_trend_cache = {}               # symbol_code -> {"time": datetime, "result": {...}}
+
+# שער ADX מינימלי — מתחת לזה אין מגמה, לא נכנסים
+ADX_MIN = 20
+
+# ============================================================
 # כלכלת פוזיציה אמיתית — Plus500, זהב (XAU/USD)
 # כל החישובים בשקלים מבוססים על המספרים האלה. עדכן לפי המסך שלך.
+# שים לב: אם פתחת בפועל 1.5 אונקיות (ולא 0.75), הרווח/הפסד האמיתי כפול
+# ממה שהבוט מציג. עדכן POSITION_SIZE_OZ אם תרצה מספרים מדויקים.
 # ============================================================
 POSITION_SIZE_OZ = 0.75   # הכמות שאתה פותח בפועל. מינימום בפלוס500 לזהב = 0.75 אונקיות.
 USD_ILS = 2.99            # שער דולר/שקל. עדכן מדי פעם (נכון ליוני 2026: ~2.99).
@@ -184,33 +204,70 @@ def get_prices(symbol, interval="15min", outputsize=50):
         print(f"שגיאה בשליפת נתונים {symbol}: {e}", flush=True)
         return None
 
-def get_daily_trend(symbol):
+def get_trend_filter(symbol_code):
+    """
+    פילטר מגמה קשה: EMA50 על נרות שעה.
+    מחזיר {"allowed": "long"/"short"/"none", "ema", "deviation_pct", "price"}.
+    ממטמן ל-30 דקות כדי לחסוך קריאות API (מגמת השעה כמעט לא זזה בין סריקות).
+    None = כשל בנתונים → הבוט לא ישלח כלום (fail-safe).
+    """
+    now = datetime.datetime.now()
+    cached = _trend_cache.get(symbol_code)
+    if cached and (now - cached["time"]).total_seconds() < TREND_CACHE_MINUTES * 60:
+        return cached["result"]
     try:
         url = "https://api.twelvedata.com/time_series"
         params = {
-            "symbol": symbol,
-            "interval": "1day",
-            "outputsize": 20,
+            "symbol": symbol_code,
+            "interval": TREND_INTERVAL,
+            "outputsize": 200,
             "apikey": TWELVEDATA_KEY
         }
         r = requests.get(url, params=params, timeout=15)
         data = r.json()
         if "values" not in data:
+            print(f"[TREND] שגיאה: {data.get('message', 'לא ידוע')}", flush=True)
             return None
         closes = [float(v["close"]) for v in reversed(data["values"])]
-        ma20 = sum(closes[-20:]) / 20
+        if len(closes) < TREND_EMA_PERIOD + 10:
+            print(f"[TREND] לא מספיק נרות ({len(closes)})", flush=True)
+            return None
+        ema_series = calc_ema_series(closes, TREND_EMA_PERIOD)
+        ema = ema_series[-1]
         current = closes[-1]
-        if current > ma20 * 1.01:
-            return "עלייה"
-        elif current < ma20 * 0.99:
-            return "ירידה"
-        return "ניטרלי"
-    except:
+        deviation = (current - ema) / ema
+        if deviation > TREND_DEADZONE:
+            allowed = "long"
+        elif deviation < -TREND_DEADZONE:
+            allowed = "short"
+        else:
+            allowed = "none"
+        result = {
+            "allowed": allowed,
+            "ema": round(ema, 2),
+            "deviation_pct": round(deviation * 100, 2),
+            "price": round(current, 2)
+        }
+        _trend_cache[symbol_code] = {"time": now, "result": result}
+        print(f"[TREND] {symbol_code}: {allowed} | מחיר {round(current,2)} | EMA50 {round(ema,2)} | {round(deviation*100,2):+.2f}%", flush=True)
+        return result
+    except Exception as e:
+        print(f"[TREND] exception: {e}", flush=True)
         return None
 
 # ============================================================
 # אינדיקטורים
 # ============================================================
+def calc_ema_series(prices, period):
+    """סדרת EMA מלאה (משמש גם ל-MACD וגם לפילטר המגמה)."""
+    if not prices:
+        return []
+    k = 2 / (period + 1)
+    out = [prices[0]]
+    for p in prices[1:]:
+        out.append(p * k + out[-1] * (1 - k))
+    return out
+
 def calc_rsi(prices, period=14):
     if len(prices) < period + 1:
         return None
@@ -227,19 +284,17 @@ def calc_rsi(prices, period=14):
     return round(100 - (100 / (1 + rs)), 2)
 
 def calc_macd(prices):
-    if len(prices) < 26:
+    """
+    MACD תקין: קו MACD = EMA12 - EMA26, קו איתות = EMA9 של *קו ה-MACD*.
+    (בגרסה הקודמת קו האיתות חושב על המחירים הגולמיים — באג.)
+    """
+    if len(prices) < 35:
         return None, None
-    def ema(data, period):
-        k = 2 / (period + 1)
-        ema_val = data[0]
-        for p in data[1:]:
-            ema_val = p * k + ema_val * (1 - k)
-        return ema_val
-    ema12 = ema(prices[-26:], 12)
-    ema26 = ema(prices[-26:], 26)
-    macd_line = ema12 - ema26
-    signal = ema(prices[-9:], 9) if len(prices) >= 35 else macd_line
-    return round(macd_line, 4), round(signal, 4)
+    ema12 = calc_ema_series(prices, 12)
+    ema26 = calc_ema_series(prices, 26)
+    macd_series = [a - b for a, b in zip(ema12, ema26)]
+    signal_series = calc_ema_series(macd_series, 9)
+    return round(macd_series[-1], 4), round(signal_series[-1], 4)
 
 def calc_bollinger(prices, period=20):
     if len(prices) < period:
@@ -329,6 +384,18 @@ def is_trading_hours(symbol_name):
 def get_today_key():
     return datetime.datetime.now().strftime("%Y-%m-%d")
 
+def consecutive_loss_block(data):
+    """Circuit breaker: 3 הפסדים רצופים היום → עצירת איתותים חדשים עד מחר."""
+    today = get_today_key()
+    closed_today = [
+        t for t in data["trades"]
+        if t.get("status") == "closed" and t.get("result")
+        and t.get("entry_time", "").startswith(today)
+    ]
+    if len(closed_today) < CONSECUTIVE_LOSS_LIMIT:
+        return False
+    return all(t.get("result") == "loss" for t in closed_today[-CONSECUTIVE_LOSS_LIMIT:])
+
 def can_trade(symbol_name, data):
     today = get_today_key()
     daily = data["daily_stats"].get(today, {})
@@ -345,6 +412,10 @@ def can_trade(symbol_name, data):
     open_trades = [t for t in data["trades"] if t["status"] == "open"]
     if len(open_trades) >= MAX_PARALLEL_TRADES:
         return False, "2 עסקאות פתוחות כבר"
+
+    # Circuit breaker — 3 הפסדים ברצף
+    if consecutive_loss_block(data):
+        return False, f"{CONSECUTIVE_LOSS_LIMIT} הפסדים ברצף — עצירה עד מחר"
 
     # מגבלת הפסד יומית — מנוטרלת
     if DAILY_LOSS_LIMIT is not None:
@@ -370,7 +441,7 @@ def check_open_trades_for_symbol(symbol_name, data):
     return None
 
 # ============================================================
-# ניתוח ושליחת סיגנל
+# ניתוח ושליחת סיגנל  — trend-following עם פילטר מגמה קשה
 # ============================================================
 def analyze_and_signal(symbol_name, symbol_code, data):
     if not is_trading_hours(symbol_name):
@@ -391,95 +462,104 @@ def analyze_and_signal(symbol_name, symbol_code, data):
     lows = prices_data["lows"]
     current = closes[-1]
 
+    # --- אינדיקטורים ---
     rsi = calc_rsi(closes)
     macd_line, macd_signal = calc_macd(closes)
     bb_upper, bb_mid, bb_lower = calc_bollinger(closes)
     atr = calc_atr(highs, lows, closes)
     adx = calc_adx(highs, lows, closes)
     breakout_dir = check_breakout(closes, highs, lows)
-    daily_trend = get_daily_trend(symbol_code)
+
+    # --- פילטר מגמה קשה: EMA50 על 1h קובע איזה כיוון בכלל מותר ---
+    trend = get_trend_filter(symbol_code)
+    if not trend:
+        print(f"[{symbol_name}] מדלג: אין נתוני מגמה (fail-safe)", flush=True)
+        return
+    if trend["allowed"] == "none":
+        print(f"[{symbol_name}] מדלג: דשדוש ({trend['deviation_pct']:+.2f}% מ-EMA50)", flush=True)
+        return
+
+    direction = "קנייה" if trend["allowed"] == "long" else "מכירה"
+    is_long = (direction == "קנייה")
+
+    # --- שער ADX: בלי מגמה חזקה מספיק, לא נכנסים ---
+    if adx is not None and adx < ADX_MIN:
+        print(f"[{symbol_name}] מדלג: ADX {adx} < {ADX_MIN} (מגמה חלשה)", flush=True)
+        return
 
     weights = data["indicator_weights"]
     signals = []
-    direction = None
-    score = 0
+    score = 0.0
 
+    # --- MACD: מומנטום בכיוון המגמה ---
+    if macd_line is not None and macd_signal is not None:
+        if is_long and macd_line > macd_signal:
+            signals.append(f"📈 MACD תומך ({macd_line})")
+            score += 1 * weights["macd"]
+        elif (not is_long) and macd_line < macd_signal:
+            signals.append(f"📉 MACD תומך ({macd_line})")
+            score += 1 * weights["macd"]
+
+    # --- פריצה בכיוון המגמה ---
+    if breakout_dir == "למעלה" and is_long:
+        signals.append("💥 פריצה למעלה")
+        score += 1 * weights["breakout"]
+    elif breakout_dir == "למטה" and not is_long:
+        signals.append("💥 פריצה למטה")
+        score += 1 * weights["breakout"]
+
+    # --- RSI: כניסה על תיקון בתוך המגמה, לא על קיצון ---
     if rsi is not None:
-        if rsi <= 30:
-            signals.append(f"🔵 RSI = {rsi} (מכירת יתר)")
-            score += 1 * weights["rsi"]
-            direction = "קנייה"
-        elif rsi >= 70:
-            signals.append(f"🔴 RSI = {rsi} (קנייה יתר)")
-            score += 1 * weights["rsi"]
-            direction = "מכירה"
+        if is_long:
+            if 40 <= rsi <= 65:
+                signals.append(f"🟢 RSI {rsi} (תיקון בריא)")
+                score += 1 * weights["rsi"]
+            elif rsi >= 75:
+                signals.append(f"⚠️ RSI {rsi} (מתוח מדי)")
+                score -= 0.5
+        else:
+            if 35 <= rsi <= 60:
+                signals.append(f"🔴 RSI {rsi} (תיקון בריא)")
+                score += 1 * weights["rsi"]
+            elif rsi <= 25:
+                signals.append(f"⚠️ RSI {rsi} (מתוח מדי)")
+                score -= 0.5
 
-    if macd_line is not None:
-        if macd_line > macd_signal and (direction == "קנייה" or direction is None):
-            signals.append(f"📈 MACD חיובי ({macd_line})")
-            score += 1 * weights["macd"]
-            if direction is None:
-                direction = "קנייה"
-        elif macd_line < macd_signal and (direction == "מכירה" or direction is None):
-            signals.append(f"📉 MACD שלילי ({macd_line})")
-            score += 1 * weights["macd"]
-            if direction is None:
-                direction = "מכירה"
+    # --- Bollinger: מיקום מול הרצועות ---
+    if bb_upper and bb_mid and bb_lower:
+        if is_long:
+            if current <= bb_mid:
+                signals.append("📊 מתחת לאמצע הרצועה (תיקון)")
+                score += 1 * weights["bollinger"]
+            elif current >= bb_upper:
+                signals.append("⚠️ נגע ברצועה עליונה (מתוח)")
+                score -= 0.5
+        else:
+            if current >= bb_mid:
+                signals.append("📊 מעל אמצע הרצועה (תיקון)")
+                score += 1 * weights["bollinger"]
+            elif current <= bb_lower:
+                signals.append("⚠️ נגע ברצועה תחתונה (מתוח)")
+                score -= 0.5
 
-    if bb_upper and bb_lower:
-        if current <= bb_lower and (direction == "קנייה" or direction is None):
-            signals.append(f"📊 מתחת לרצועה תחתונה ({bb_lower})")
-            score += 1 * weights["bollinger"]
-            if direction is None:
-                direction = "קנייה"
-        elif current >= bb_upper and (direction == "מכירה" or direction is None):
-            signals.append(f"📊 מעל רצועה עליונה ({bb_upper})")
-            score += 1 * weights["bollinger"]
-            if direction is None:
-                direction = "מכירה"
-
-    if breakout_dir:
-        if breakout_dir == "למעלה" and (direction == "קנייה" or direction is None):
-            signals.append("💥 פריצה למעלה")
-            score += 1 * weights["breakout"]
-            direction = "קנייה"
-        elif breakout_dir == "למטה" and (direction == "מכירה" or direction is None):
-            signals.append("💥 פריצה למטה")
-            score += 1 * weights["breakout"]
-            direction = "מכירה"
-
-    # ADX — מחזק מגמה חזקה, מחליש דשדוש (במקום הווליום)
-    if adx is not None and direction:
-        if adx >= 25:
-            signals.append(f"💪 ADX = {adx} (מגמה חזקה)")
-            score += 1 * weights["adx"]
-        elif adx < 20:
-            signals.append(f"〰️ ADX = {adx} (מגמה חלשה)")
-            score -= 1 * weights["adx"]
-
-    trend_bonus = ""
-    if daily_trend and direction:
-        if daily_trend == "עלייה" and direction == "קנייה":
-            score += 0.5
-            trend_bonus = "✅ עם המגמה"
-        elif daily_trend == "ירידה" and direction == "מכירה":
-            score += 0.5
-            trend_bonus = "✅ עם המגמה"
-        elif daily_trend != "ניטרלי":
-            score -= 0.5
-            trend_bonus = "⚠️ נגד המגמה"
+    # --- ADX: עוצמת מגמה מחזקת ---
+    if adx is not None and adx >= 25:
+        signals.append(f"💪 ADX {adx} (מגמה חזקה)")
+        score += 1 * weights["adx"]
 
     stars = min(5, max(1, round(score)))
     star_display = "⭐" * stars
 
-    if not direction or stars < 2:
-        print(f"[{datetime.datetime.now().strftime('%H:%M')}] {symbol_name}: ציון {stars} — לא מספיק", flush=True)
+    # דורש לפחות 2 אינדיקטורים תומכים (לא אזהרות) — קונפלואנס אמיתי
+    supporting = [s for s in signals if not s.startswith("⚠️")]
+    if stars < 2 or len(supporting) < 2:
+        print(f"[{symbol_name}] ציון {stars}, {len(supporting)} תומכים — לא מספיק ({direction})", flush=True)
         return
 
     open_trade = check_open_trades_for_symbol(symbol_name, data)
     reversal_warning = ""
     if open_trade and open_trade["direction"] != direction:
-        reversal_warning = f"\n⚠️ <b>היפוך כיוון!</b> היית ב{open_trade['direction']}\n"
+        reversal_warning = f"\n⚠️ <b>היפוך כיוון!</b> יש עסקה פתוחה ב{open_trade['direction']}\n"
 
     if atr:
         stop_distance = atr * 1.5
@@ -504,7 +584,6 @@ def analyze_and_signal(symbol_name, symbol_code, data):
 
     now = datetime.datetime.now()
     timeout_time = (now + datetime.timedelta(hours=TRADE_TIMEOUT_HOURS)).strftime("%H:%M")
-    trend_line = f"📈 מגמה: {daily_trend} {trend_bonus}\n" if daily_trend else ""
 
     # מספר עסקה רץ
     data["trade_counter"] = data.get("trade_counter", 0) + 1
@@ -527,12 +606,18 @@ def analyze_and_signal(symbol_name, symbol_code, data):
     pending = {k: v for k, v in pending.items() if v["time"] > cutoff}
     save_pending(pending)
 
+    trend_line = (
+        f"📈 מגמה (EMA50 1h): "
+        f"{'עלייה 🟢' if is_long else 'ירידה 🔴'} "
+        f"({trend['deviation_pct']:+.2f}%)\n"
+    )
+
     msg = (
         f"🚨 <b>איתות סחר #{trade_num} — {symbol_name}</b>\n"
         f"🕐 {now.strftime('%H:%M')} | {star_display} {stars}/5\n"
         f"{reversal_warning}"
         f"━━━━━━━━━━━━━━━\n"
-        f"📊 כיוון: <b>{'קנייה 🟢' if direction == 'קנייה' else 'מכירה 🔴'}</b>\n"
+        f"📊 כיוון: <b>{'קנייה 🟢' if is_long else 'מכירה 🔴'}</b>\n"
         f"💰 כניסה: <b>{entry_price}</b>\n"
         f"🛑 סטופ: <b>{stop}</b>\n"
         f"🎯 טארגט 1: <b>{target1}</b> (סוגר הכל)\n"
@@ -567,7 +652,7 @@ def analyze_and_signal(symbol_name, symbol_code, data):
     data["daily_stats"][today]["signals_sent"] = data["daily_stats"][today].get("signals_sent", 0) + 1
 
     save_data(data)
-    print(f"[{now.strftime('%H:%M')}] ✅ איתות #{trade_num}: {symbol_name} {direction} ציון {stars}", flush=True)
+    print(f"[{now.strftime('%H:%M')}] ✅ איתות #{trade_num}: {symbol_name} {direction} {stars}⭐", flush=True)
 
 # ============================================================
 # טיפול בתגובות משתמש
@@ -883,8 +968,10 @@ def main():
         "📊 סורק: זהב (XAU/USD)\n"
         "⏰ כל 10 דקות\n"
         "🕐 שעות: 08:00—22:00 (ישראל)\n\n"
+        "🧭 <b>מצב חדש: מסחר עם המגמה בלבד</b>\n"
+        "פילטר EMA50 (1h) קובע כיוון — נגד המגמה נחסם.\n"
         "🔍 אינדיקטורים: RSI, MACD, Bollinger, פריצה, ADX\n"
-        "🎯 זיהוי אוטומטי של טארגט/סטופ (אישור ידני)"
+        "🛑 עצירה אוטומטית אחרי 3 הפסדים ברצף"
     )
 
     last_update_id = 0
