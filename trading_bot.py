@@ -28,8 +28,8 @@ TWELVEDATA_KEY = os.environ.get("TWELVE_DATA_API_KEY", "2be6ffca08d942de8903d6ae
 # ===== אחסון קבוע: GitHub Gist =====
 # GIST_ID + GIST_TOKEN מוגדרים ב-Render Environment.
 # אם חסרים — הבוט עובד עם /tmp בלבד (נתונים יימחקו ב-deploy) ושולח אזהרה.
-GIST_ID = os.environ.get("GIST_ID", "")
-GIST_TOKEN = os.environ.get("GIST_TOKEN", "")
+GIST_ID = os.environ.get("GIST_ID", "").strip()
+GIST_TOKEN = os.environ.get("GIST_TOKEN", "").strip()
 GIST_FILENAME = "bot_data.json"
 GIST_API_URL = f"https://api.github.com/gists/{GIST_ID}"
 
@@ -153,13 +153,39 @@ def gist_save(data):
             }
         }
         r = requests.patch(GIST_API_URL, headers=_gist_headers(), json=payload, timeout=15)
-        r.raise_for_status()
+        if r.status_code >= 400:
+            _gist_dirty = True
+            print(f"[GIST] שמירה נכשלה {r.status_code}: {r.text[:200]}", flush=True)
+            return False
         _gist_dirty = False
         return True
     except Exception as e:
         _gist_dirty = True
         print(f"[GIST] שמירה נכשלה (ינוסה שוב): {e}", flush=True)
         return False
+
+def gist_diagnose():
+    """
+    אבחון עצמי בהפעלה: למי שייך הטוקן ואילו הרשאות יש לו.
+    זה מגלה מיד אם הטוקן שגוי, בלי הרשאת gist, או מחשבון אחר.
+    """
+    if not gist_enabled():
+        print("[GIST-CHECK] GIST_ID/GIST_TOKEN לא מוגדרים", flush=True)
+        return
+    try:
+        r = requests.get("https://api.github.com/user", headers=_gist_headers(), timeout=15)
+        if r.status_code == 401:
+            print("[GIST-CHECK] ❌ הטוקן לא תקין (401) — הועתק שגוי, פג תוקף או נמחק", flush=True)
+            return
+        login = r.json().get("login", "?")
+        scopes = r.headers.get("X-OAuth-Scopes", "")
+        print(f"[GIST-CHECK] הטוקן שייך לחשבון: {login} | הרשאות: [{scopes}]", flush=True)
+        if "gist" not in scopes:
+            print("[GIST-CHECK] ❌ לטוקן אין הרשאת gist! צור טוקן classic חדש וסמן את התיבה gist", flush=True)
+        else:
+            print("[GIST-CHECK] ✅ הרשאת gist קיימת", flush=True)
+    except Exception as e:
+        print(f"[GIST-CHECK] בדיקה נכשלה: {e}", flush=True)
 
 def default_data():
     return {
@@ -1073,6 +1099,7 @@ def main():
     print(f"TOKEN exists: {bool(TELEGRAM_TOKEN)}", flush=True)
     print(f"CHAT_ID: {CHAT_ID}", flush=True)
     print(f"GIST configured: {gist_enabled()}", flush=True)
+    gist_diagnose()
 
     data = load_data()
 
