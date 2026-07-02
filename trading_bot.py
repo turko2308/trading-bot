@@ -6,12 +6,32 @@ import os
 import sys
 import hashlib
 
+try:
+    from zoneinfo import ZoneInfo
+    IL_TZ = ZoneInfo("Asia/Jerusalem")
+except Exception:
+    IL_TZ = None
+
+def now_il():
+    """שעון ישראל תמיד — לא תלוי באזור הזמן של השרת (Render = UTC)."""
+    if IL_TZ:
+        return datetime.datetime.now(IL_TZ)
+    return datetime.datetime.now()
+
 # ============================================================
 # הגדרות
 # ============================================================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "960197631")
 TWELVEDATA_KEY = os.environ.get("TWELVE_DATA_API_KEY", "2be6ffca08d942de8903d6aee41a312e")
+
+# ===== אחסון קבוע: GitHub Gist =====
+# GIST_ID + GIST_TOKEN מוגדרים ב-Render Environment.
+# אם חסרים — הבוט עובד עם /tmp בלבד (נתונים יימחקו ב-deploy) ושולח אזהרה.
+GIST_ID = os.environ.get("GIST_ID", "")
+GIST_TOKEN = os.environ.get("GIST_TOKEN", "")
+GIST_FILENAME = "bot_data.json"
+GIST_API_URL = f"https://api.github.com/gists/{GIST_ID}"
 
 # רק זהב (XAU/USD היחיד שעובד בחינמי של Twelve Data)
 SYMBOLS = {
@@ -24,7 +44,6 @@ TRADING_HOURS = {
 }
 
 # ===== מגבלות איתותים =====
-# עד 10 עסקאות שנכנסת אליהן ביום. אם רק צופה ולא נכנס — האיתותים ממשיכים עד 20.
 MAX_ENTERED_PER_DAY = 10
 MAX_SIGNALS_PER_DAY = 20
 MAX_PARALLEL_TRADES = 2
@@ -38,51 +57,116 @@ DAILY_LOSS_LIMIT = None
 CONSECUTIVE_LOSS_LIMIT = 3
 
 ACCOUNT_SIZE = 500
-RISK_PER_TRADE = 0.02   # לתצוגה/השוואה בלבד — אינו משמש לחישוב הרווח/הפסד
+RISK_PER_TRADE = 0.02   # לתצוגה/השוואה בלבד
 
 # ============================================================
 # פילטר מגמה קשה (Hard trend filter)
 # EMA50 על נרות שעה. קובע איזה כיוון בכלל מותר לפתוח.
-# מחיר מעל ה-EMA ביותר מ-0.3% → רק לונג. מתחת ל-0.3% → רק שורט.
-# באמצע (דשדוש) → אין איתותים בכלל.
 # ============================================================
 TREND_INTERVAL = "1h"
 TREND_EMA_PERIOD = 50
-TREND_DEADZONE = 0.003          # ±0.3% סביב ה-EMA = דשדוש
-TREND_CACHE_MINUTES = 30        # מטמון — לחסוך קריאות API (ה-1h לא זז מהר)
-_trend_cache = {}               # symbol_code -> {"time": datetime, "result": {...}}
+TREND_DEADZONE = 0.003          # ±0.3% סביב ה-EMA = דשדוש, אין איתותים
+TREND_CACHE_MINUTES = 30
+_trend_cache = {}
 
 # שער ADX מינימלי — מתחת לזה אין מגמה, לא נכנסים
 ADX_MIN = 20
 
+# ניקיון נתונים — שלא יתנפחו לנצח
+MAX_STORED_TRADES = 300
+DAILY_STATS_KEEP_DAYS = 90
+
 # ============================================================
 # כלכלת פוזיציה אמיתית — Plus500, זהב (XAU/USD)
-# כל החישובים בשקלים מבוססים על המספרים האלה. עדכן לפי המסך שלך.
-# שים לב: אם פתחת בפועל 1.5 אונקיות (ולא 0.75), הרווח/הפסד האמיתי כפול
-# ממה שהבוט מציג. עדכן POSITION_SIZE_OZ אם תרצה מספרים מדויקים.
+# שים לב: אם אתה פותח בפועל 1.5 אונקיות (ולא 0.75), הרווח/הפסד
+# האמיתי כפול ממה שהבוט מציג. עדכן POSITION_SIZE_OZ בהתאם.
 # ============================================================
-POSITION_SIZE_OZ = 0.75   # הכמות שאתה פותח בפועל. מינימום בפלוס500 לזהב = 0.75 אונקיות.
-USD_ILS = 2.99            # שער דולר/שקל. עדכן מדי פעם (נכון ליוני 2026: ~2.99).
-SPREAD_POINTS = 0.77      # מרווח (spread) בזהב בפלוס500, בנקודות מחיר.
+POSITION_SIZE_OZ = 0.75
+USD_ILS = 2.99
+SPREAD_POINTS = 0.77
 
 def points_to_ils(points):
-    """המרת מרחק מחיר (נקודות $/אונקיה) לשקלים, לפי גודל הפוזיציה ושער הדולר."""
     return POSITION_SIZE_OZ * abs(points) * USD_ILS
 
-# עלות הספרד לעסקה (משולמת בכניסה), בשקלים
 SPREAD_COST_ILS = round(POSITION_SIZE_OZ * SPREAD_POINTS * USD_ILS, 2)
 
 DATA_FILE = "/tmp/bot_data.json"
-PENDING_FILE = "/tmp/pending_signals.json"
 
 # ============================================================
-# שמירת מצב
+# אחסון: Gist (קבוע) + /tmp (גיבוי מקומי מהיר)
+#
+# עיקרון: קוראים מה-Gist פעם אחת בהפעלה. משם — הנתונים חיים
+# בזיכרון. כל שמירה כותבת ל-/tmp (מיידי) וגם דוחפת ל-Gist.
+# אם דחיפה ל-Gist נכשלת — מסמנים dirty ומנסים שוב בסריקה הבאה.
 # ============================================================
-def load_data():
-    default = {
+_gist_dirty = False
+_storage_source = "default"   # gist / tmp / default / gist_fail
+
+def gist_enabled():
+    return bool(GIST_ID and GIST_TOKEN)
+
+def _gist_headers():
+    return {
+        "Authorization": f"Bearer {GIST_TOKEN}",
+        "Accept": "application/vnd.github+json"
+    }
+
+def gist_load():
+    """מחזיר dict אם הצליח (גם ריק), None אם נכשל."""
+    try:
+        r = requests.get(GIST_API_URL, headers=_gist_headers(), timeout=15)
+        if r.status_code == 404:
+            print("[GIST] שגיאה 404 — GIST_ID שגוי?", flush=True)
+            return None
+        if r.status_code == 401:
+            print("[GIST] שגיאה 401 — GIST_TOKEN שגוי או בלי הרשאת gist", flush=True)
+            return None
+        r.raise_for_status()
+        f = r.json().get("files", {}).get(GIST_FILENAME)
+        if not f:
+            print(f"[GIST] הקובץ {GIST_FILENAME} לא נמצא ב-Gist — מתחיל ריק", flush=True)
+            return {}
+        # קבצים מעל ~1MB חוזרים חתוכים — מושכים מה-raw_url
+        if f.get("truncated") and f.get("raw_url"):
+            rr = requests.get(f["raw_url"], timeout=15)
+            rr.raise_for_status()
+            content = rr.text
+        else:
+            content = f.get("content", "")
+        content = content.strip()
+        if not content:
+            return {}
+        return json.loads(content)
+    except Exception as e:
+        print(f"[GIST] קריאה נכשלה: {e}", flush=True)
+        return None
+
+def gist_save(data):
+    """דוחף את הנתונים ל-Gist. מחזיר True/False."""
+    global _gist_dirty
+    try:
+        payload = {
+            "files": {
+                GIST_FILENAME: {
+                    "content": json.dumps(data, ensure_ascii=False, indent=2)
+                }
+            }
+        }
+        r = requests.patch(GIST_API_URL, headers=_gist_headers(), json=payload, timeout=15)
+        r.raise_for_status()
+        _gist_dirty = False
+        return True
+    except Exception as e:
+        _gist_dirty = True
+        print(f"[GIST] שמירה נכשלה (ינוסה שוב): {e}", flush=True)
+        return False
+
+def default_data():
+    return {
         "trades": [],
         "daily_stats": {},
         "signal_history": [],
+        "pending": {},
         "trade_counter": 0,
         "indicator_weights": {
             "rsi": 1.0,
@@ -99,43 +183,69 @@ def load_data():
             "early_exits": 0
         }
     }
+
+def _merge_defaults(data):
+    d = default_data()
+    for k, v in d.items():
+        if k not in data:
+            data[k] = v
+    for k in d["indicator_weights"]:
+        if k not in data["indicator_weights"]:
+            data["indicator_weights"][k] = 1.0
+    return data
+
+def load_data():
+    """
+    נקרא פעם אחת בהפעלה.
+    סדר עדיפויות: Gist → /tmp → ברירת מחדל.
+    """
+    global _storage_source
+    if gist_enabled():
+        g = gist_load()
+        if g is not None:
+            _storage_source = "gist"
+            print("[STORAGE] נטען מ-Gist", flush=True)
+            return _merge_defaults(g)
+        _storage_source = "gist_fail"
+        print("[STORAGE] Gist נכשל — עובר ל-/tmp", flush=True)
     try:
         if os.path.exists(DATA_FILE):
             with open(DATA_FILE, "r") as f:
                 data = json.load(f)
-                # ודא שכל המפתחות קיימים (תאימות לאחור)
-                for k, v in default.items():
-                    if k not in data:
-                        data[k] = v
-                if "adx" not in data["indicator_weights"]:
-                    data["indicator_weights"]["adx"] = 1.0
-                return data
-    except:
-        pass
-    return default
+            if _storage_source != "gist_fail":
+                _storage_source = "tmp"
+            print("[STORAGE] נטען מ-/tmp", flush=True)
+            return _merge_defaults(data)
+    except Exception as e:
+        print(f"[STORAGE] קריאת /tmp נכשלה: {e}", flush=True)
+    if _storage_source not in ("gist_fail",):
+        _storage_source = "default"
+    print("[STORAGE] מתחיל מנתונים ריקים", flush=True)
+    return default_data()
+
+def prune_data(data):
+    """מונע התנפחות: שומר 300 עסקאות אחרונות ו-90 ימי סטטיסטיקה."""
+    trades = data.get("trades", [])
+    if len(trades) > MAX_STORED_TRADES:
+        open_trades = [t for t in trades if t.get("status") == "open"]
+        closed = [t for t in trades if t.get("status") != "open"]
+        keep = MAX_STORED_TRADES - len(open_trades)
+        data["trades"] = closed[-keep:] + open_trades if keep > 0 else open_trades
+    daily = data.get("daily_stats", {})
+    if len(daily) > DAILY_STATS_KEEP_DAYS:
+        for k in sorted(daily.keys())[:-DAILY_STATS_KEEP_DAYS]:
+            del daily[k]
 
 def save_data(data):
+    """כותב ל-/tmp (גיבוי מקומי) ודוחף ל-Gist (אחסון קבוע)."""
+    prune_data(data)
     try:
         with open(DATA_FILE, "w") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"שגיאה בשמירה: {e}", flush=True)
-
-def load_pending():
-    try:
-        if os.path.exists(PENDING_FILE):
-            with open(PENDING_FILE, "r") as f:
-                return json.load(f)
-    except:
-        pass
-    return {}
-
-def save_pending(pending):
-    try:
-        with open(PENDING_FILE, "w") as f:
-            json.dump(pending, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"שגיאה בשמירת pending: {e}", flush=True)
+        print(f"שגיאה בשמירה מקומית: {e}", flush=True)
+    if gist_enabled():
+        gist_save(data)
 
 def make_trade_id(symbol_name, ts):
     raw = f"{symbol_name}_{ts}"
@@ -208,10 +318,9 @@ def get_trend_filter(symbol_code):
     """
     פילטר מגמה קשה: EMA50 על נרות שעה.
     מחזיר {"allowed": "long"/"short"/"none", "ema", "deviation_pct", "price"}.
-    ממטמן ל-30 דקות כדי לחסוך קריאות API (מגמת השעה כמעט לא זזה בין סריקות).
-    None = כשל בנתונים → הבוט לא ישלח כלום (fail-safe).
+    ממוטמן ל-30 דקות. None = כשל בנתונים → לא שולחים כלום (fail-safe).
     """
-    now = datetime.datetime.now()
+    now = now_il()
     cached = _trend_cache.get(symbol_code)
     if cached and (now - cached["time"]).total_seconds() < TREND_CACHE_MINUTES * 60:
         return cached["result"]
@@ -232,8 +341,7 @@ def get_trend_filter(symbol_code):
         if len(closes) < TREND_EMA_PERIOD + 10:
             print(f"[TREND] לא מספיק נרות ({len(closes)})", flush=True)
             return None
-        ema_series = calc_ema_series(closes, TREND_EMA_PERIOD)
-        ema = ema_series[-1]
+        ema = calc_ema_series(closes, TREND_EMA_PERIOD)[-1]
         current = closes[-1]
         deviation = (current - ema) / ema
         if deviation > TREND_DEADZONE:
@@ -285,8 +393,8 @@ def calc_rsi(prices, period=14):
 
 def calc_macd(prices):
     """
-    MACD תקין: קו MACD = EMA12 - EMA26, קו איתות = EMA9 של *קו ה-MACD*.
-    (בגרסה הקודמת קו האיתות חושב על המחירים הגולמיים — באג.)
+    MACD תקין: קו MACD = EMA12 - EMA26, קו איתות = EMA9 של קו ה-MACD.
+    (בגרסה הישנה קו האיתות חושב בטעות על המחירים הגולמיים.)
     """
     if len(prices) < 35:
         return None, None
@@ -377,23 +485,24 @@ def check_breakout(prices, highs, lows, candles=20):
 # בדיקות מגבלות
 # ============================================================
 def is_trading_hours(symbol_name):
-    now = datetime.datetime.now()
+    now = now_il()
     hours = TRADING_HOURS.get(symbol_name, {"start": 8, "end": 22})
     return hours["start"] <= now.hour < hours["end"]
 
 def get_today_key():
-    return datetime.datetime.now().strftime("%Y-%m-%d")
+    return now_il().strftime("%Y-%m-%d")
 
 def consecutive_loss_block(data):
-    """Circuit breaker: 3 הפסדים רצופים היום → עצירת איתותים חדשים עד מחר."""
+    """Circuit breaker: 3 הפסדים רצופים (לפי זמן סגירה, היום) → עצירה עד מחר."""
     today = get_today_key()
     closed_today = [
         t for t in data["trades"]
         if t.get("status") == "closed" and t.get("result")
-        and t.get("entry_time", "").startswith(today)
+        and t.get("close_time", t.get("entry_time", "")).startswith(today)
     ]
     if len(closed_today) < CONSECUTIVE_LOSS_LIMIT:
         return False
+    closed_today.sort(key=lambda t: t.get("close_time", t.get("entry_time", "")))
     return all(t.get("result") == "loss" for t in closed_today[-CONSECUTIVE_LOSS_LIMIT:])
 
 def can_trade(symbol_name, data):
@@ -403,7 +512,6 @@ def can_trade(symbol_name, data):
     entered = daily.get("entered", 0)
     signals_sent = daily.get("signals_sent", 0)
 
-    # נכנסת ל-10 עסקאות → עצור. אחרת, איתותים ממשיכים עד תקרה של 20 שנשלחו.
     if entered >= MAX_ENTERED_PER_DAY:
         return False, f"הגעת ל-{MAX_ENTERED_PER_DAY} עסקאות היום"
     if signals_sent >= MAX_SIGNALS_PER_DAY:
@@ -413,17 +521,15 @@ def can_trade(symbol_name, data):
     if len(open_trades) >= MAX_PARALLEL_TRADES:
         return False, "2 עסקאות פתוחות כבר"
 
-    # Circuit breaker — 3 הפסדים ברצף
     if consecutive_loss_block(data):
         return False, f"{CONSECUTIVE_LOSS_LIMIT} הפסדים ברצף — עצירה עד מחר"
 
-    # מגבלת הפסד יומית — מנוטרלת
     if DAILY_LOSS_LIMIT is not None:
         daily_pnl = daily.get("pnl", 0)
         if daily_pnl <= -DAILY_LOSS_LIMIT:
             return False, "הגעת למגבלת הפסד יומית"
 
-    now = datetime.datetime.now()
+    now = now_il()
     recent_signals = [
         s for s in data["signal_history"]
         if s["symbol"] == symbol_name and
@@ -441,7 +547,7 @@ def check_open_trades_for_symbol(symbol_name, data):
     return None
 
 # ============================================================
-# ניתוח ושליחת סיגנל  — trend-following עם פילטר מגמה קשה
+# ניתוח ושליחת סיגנל — trend-following עם פילטר מגמה קשה
 # ============================================================
 def analyze_and_signal(symbol_name, symbol_code, data):
     if not is_trading_hours(symbol_name):
@@ -569,7 +675,6 @@ def analyze_and_signal(symbol_name, symbol_code, data):
     entry_price = round(current, 2)
     tp2_mult = 4 if stars >= 4 else 3
 
-    # סיכון אמיתי בשקלים
     risk_amount = round(points_to_ils(stop_distance) + SPREAD_COST_ILS, 2)
     risk_pct = round(risk_amount / ACCOUNT_SIZE * 100, 1)
 
@@ -582,16 +687,16 @@ def analyze_and_signal(symbol_name, symbol_code, data):
         target1 = round(current - stop_distance * 2, 2)
         target2 = round(current - stop_distance * tp2_mult, 2)
 
-    now = datetime.datetime.now()
+    now = now_il()
     timeout_time = (now + datetime.timedelta(hours=TRADE_TIMEOUT_HOURS)).strftime("%H:%M")
 
-    # מספר עסקה רץ
+    # מספר עסקה רץ (נשמר ב-Gist — לא מתאפס ב-deploy)
     data["trade_counter"] = data.get("trade_counter", 0) + 1
     trade_num = data["trade_counter"]
 
-    # שמור pending
+    # שמור pending בתוך הנתונים (שורד deploy)
     trade_id = make_trade_id(symbol_name, now.strftime('%H%M%S'))
-    pending = load_pending()
+    pending = data.setdefault("pending", {})
     pending[trade_id] = {
         "number": trade_num,
         "symbol": symbol_name,
@@ -600,11 +705,11 @@ def analyze_and_signal(symbol_name, symbol_code, data):
         "stop": stop,
         "target1": target1,
         "target2": target2,
+        "stars": stars,
         "time": now.isoformat()
     }
     cutoff = (now - datetime.timedelta(hours=1)).isoformat()
-    pending = {k: v for k, v in pending.items() if v["time"] > cutoff}
-    save_pending(pending)
+    data["pending"] = {k: v for k, v in pending.items() if v["time"] > cutoff}
 
     trend_line = (
         f"📈 מגמה (EMA50 1h): "
@@ -668,7 +773,7 @@ def handle_callbacks(data, last_update_id):
             cbd = cb["data"]
             print(f"[CALLBACK] קיבלתי: {cbd}", flush=True)
 
-            pending = load_pending()
+            pending = data.get("pending", {})
 
             # ✅ נכנסתי לעסקה
             if cbd.startswith("en_"):
@@ -677,11 +782,10 @@ def handle_callbacks(data, last_update_id):
                 if not signal:
                     send_telegram("⚠️ הסיגנל פג תוקף")
                     continue
-                # מנע כניסה כפולה
                 if any(t["id"] == trade_id for t in data["trades"]):
                     send_telegram("⚠️ כבר נכנסת לעסקה הזו")
                     continue
-                now = datetime.datetime.now()
+                now = now_il()
                 timeout = (now + datetime.timedelta(hours=TRADE_TIMEOUT_HOURS)).isoformat()
                 num = signal.get("number", "?")
                 trade = {
@@ -693,6 +797,7 @@ def handle_callbacks(data, last_update_id):
                     "stop": signal["stop"],
                     "target1": signal["target1"],
                     "target2": signal["target2"],
+                    "stars": signal.get("stars"),
                     "entry_time": now.isoformat(),
                     "timeout": timeout,
                     "status": "open",
@@ -701,6 +806,7 @@ def handle_callbacks(data, last_update_id):
                     "timeout_sent": False
                 }
                 data["trades"].append(trade)
+                pending.pop(trade_id, None)
                 today = get_today_key()
                 if today not in data["daily_stats"]:
                     data["daily_stats"][today] = {}
@@ -744,7 +850,6 @@ def handle_callbacks(data, last_update_id):
                 if not trade:
                     send_telegram("⚠️ לא נמצאה עסקה")
                     continue
-                # רווח אמיתי בשקלים, מבוסס טארגט 1 (1:2), פחות ספרד
                 risk_distance = abs(trade["entry"] - trade["stop"])
                 reward_distance = abs(trade["target1"] - trade["entry"])
                 r_multiple = (reward_distance / risk_distance) if risk_distance else 0
@@ -752,6 +857,7 @@ def handle_callbacks(data, last_update_id):
                 trade["status"] = "closed"
                 trade["result"] = "win"
                 trade["pnl"] = pnl
+                trade["close_time"] = now_il().isoformat()
                 data["all_time_stats"]["wins"] += 1
                 data["all_time_stats"]["total_trades"] += 1
                 data["all_time_stats"]["total_pnl"] = round(data["all_time_stats"].get("total_pnl", 0) + pnl, 2)
@@ -781,12 +887,12 @@ def handle_callbacks(data, last_update_id):
                 if not trade:
                     send_telegram("⚠️ לא נמצאה עסקה")
                     continue
-                # הפסד אמיתי בשקלים, מבוסס מרחק הסטופ, פלוס ספרד
                 risk_distance = abs(trade["entry"] - trade["stop"])
                 loss = round(points_to_ils(risk_distance) + SPREAD_COST_ILS, 2)
                 trade["status"] = "closed"
                 trade["result"] = "loss"
                 trade["pnl"] = -loss
+                trade["close_time"] = now_il().isoformat()
                 data["all_time_stats"]["losses"] += 1
                 data["all_time_stats"]["total_trades"] += 1
                 data["all_time_stats"]["total_pnl"] = round(data["all_time_stats"].get("total_pnl", 0) - loss, 2)
@@ -802,9 +908,8 @@ def handle_callbacks(data, last_update_id):
             msg = update["message"]
             text = msg.get("text", "").strip()
             waiting_trade = next((t for t in data["trades"] if t.get("waiting_early_exit") and t["status"] == "open"), None)
-            if waiting_trade and text.replace(".", "").isdigit():
+            if waiting_trade and text.replace(".", "").replace("-", "").isdigit():
                 amount = float(text)
-                # יעילות מול הרווח האמיתי בטארגט 1 (שקלים)
                 reward_distance = abs(waiting_trade["target1"] - waiting_trade["entry"])
                 full_target_profit = points_to_ils(reward_distance) - SPREAD_COST_ILS
                 efficiency = round((amount / full_target_profit) * 100) if full_target_profit > 0 else 0
@@ -815,6 +920,7 @@ def handle_callbacks(data, last_update_id):
                 waiting_trade["status"] = "closed"
                 waiting_trade["result"] = "early_exit"
                 waiting_trade["pnl"] = amount
+                waiting_trade["close_time"] = now_il().isoformat()
                 waiting_trade.pop("waiting_early_exit", None)
                 data["all_time_stats"]["wins"] += 1
                 data["all_time_stats"]["early_exits"] += 1
@@ -831,10 +937,10 @@ def handle_callbacks(data, last_update_id):
     return last_update_id
 
 # ============================================================
-# מעקב עסקאות פתוחות + זיהוי אוטומטי (שיטה א: high/low)
+# מעקב עסקאות פתוחות + זיהוי אוטומטי (high/low)
 # ============================================================
 def monitor_open_trades(data):
-    now = datetime.datetime.now()
+    now = now_il()
     candle_cache = {}
     changed = False
 
@@ -867,7 +973,6 @@ def monitor_open_trades(data):
         target1 = trade["target1"]
         num = trade.get("number", "?")
 
-        # קביעת נגיעה לפי high/low של הנר
         target_hit = (high >= target1) if direction == "קנייה" else (low <= target1)
         stop_hit = (low <= stop) if direction == "קנייה" else (high >= stop)
 
@@ -900,7 +1005,11 @@ def monitor_open_trades(data):
 
         # תזכורת timeout
         timeout = datetime.datetime.fromisoformat(trade["timeout"])
-        if now >= timeout and not trade.get("timeout_sent"):
+        try:
+            expired = now >= timeout
+        except TypeError:
+            expired = True  # ערבוב aware/naive מנתונים ישנים — שלח תזכורת ליתר ביטחון
+        if expired and not trade.get("timeout_sent"):
             trade["timeout_sent"] = True
             changed = True
             keyboard = [[{"text": "🔒 סגרתי עסקה", "callback_data": f"cl_{trade['id']}"}]]
@@ -943,6 +1052,7 @@ def send_daily_report(data):
     pnl_today = daily.get("pnl", 0)
     win_rate = round(stats["wins"] / stats["total_trades"] * 100) if stats["total_trades"] > 0 else 0
     total_pnl = round(stats.get("total_pnl", 0), 2)
+    storage_note = "" if _storage_source == "gist" else "\n⚠️ אחסון זמני בלבד — הנתונים לא ב-Gist!"
     send_telegram(
         f"📊 <b>דוח יומי — {today}</b>\n\n"
         f"🔔 איתותים שנשלחו: {signals_today}\n"
@@ -952,26 +1062,37 @@ def send_daily_report(data):
         f"✅ רווחים: {stats['wins']} | ❌ הפסדים: {stats['losses']}\n"
         f"📊 אחוז הצלחה: {win_rate}%\n"
         f"🏦 רווח/הפסד מצטבר: {total_pnl} ש\"ח"
+        f"{storage_note}"
     )
 
 # ============================================================
 # לולאה ראשית
 # ============================================================
 def main():
-    print("🤖 בוט מסחר מופעל!", flush=True)
+    print("🤖 בוט מסחר מופעל! (v3: פילטר מגמה + Gist)", flush=True)
     print(f"TOKEN exists: {bool(TELEGRAM_TOKEN)}", flush=True)
     print(f"CHAT_ID: {CHAT_ID}", flush=True)
+    print(f"GIST configured: {gist_enabled()}", flush=True)
 
     data = load_data()
+
+    if _storage_source == "gist":
+        storage_line = "💾 אחסון קבוע: GitHub Gist ✅"
+    elif _storage_source == "gist_fail":
+        storage_line = "🚨 Gist מוגדר אבל נכשל! בדוק GIST_ID/GIST_TOKEN ב-Render"
+    elif gist_enabled():
+        storage_line = "💾 אחסון קבוע: GitHub Gist ✅"
+    else:
+        storage_line = "⚠️ אחסון זמני בלבד (/tmp) — הגדר GIST_ID + GIST_TOKEN ב-Render"
+
     send_telegram(
-        "🤖 <b>בוט המסחר הופעל!</b>\n\n"
+        "🤖 <b>בוט המסחר הופעל!</b> (גרסה 3)\n\n"
         "📊 סורק: זהב (XAU/USD)\n"
-        "⏰ כל 10 דקות\n"
-        "🕐 שעות: 08:00—22:00 (ישראל)\n\n"
-        "🧭 <b>מצב חדש: מסחר עם המגמה בלבד</b>\n"
-        "פילטר EMA50 (1h) קובע כיוון — נגד המגמה נחסם.\n"
-        "🔍 אינדיקטורים: RSI, MACD, Bollinger, פריצה, ADX\n"
-        "🛑 עצירה אוטומטית אחרי 3 הפסדים ברצף"
+        "⏰ כל 10 דקות | 🕐 08:00—22:00 (ישראל)\n\n"
+        "🧭 <b>מסחר עם המגמה בלבד</b>\n"
+        "פילטר EMA50 (1h) קובע כיוון — נגד המגמה נחסם\n"
+        "🛑 עצירה אוטומטית אחרי 3 הפסדים ברצף\n"
+        f"{storage_line}"
     )
 
     last_update_id = 0
@@ -979,18 +1100,16 @@ def main():
     last_morning_ping = ""
     scan_count = 0
 
-    # הפרדה: כפתורים נבדקים כל POLL_INTERVAL שניות, סריקת שוק כל SCAN_INTERVAL שניות
     SCAN_INTERVAL = 600   # 10 דקות בין סריקות שוק
     POLL_INTERVAL = 2     # תדירות בדיקת כפתורים (שניות)
-    last_scan_time = 0    # 0 → סריקה ראשונה מיד
+    last_scan_time = 0
 
     while True:
         try:
-            now = datetime.datetime.now()
+            now = now_il()
 
             # --- בדיקת כפתורים (תכופה → תגובה מיידית) ---
             last_update_id = handle_callbacks(data, last_update_id)
-            data = load_data()
 
             # --- סריקת שוק + מעקב עסקאות: כל 10 דקות ---
             if time.time() - last_scan_time >= SCAN_INTERVAL:
@@ -1001,13 +1120,17 @@ def main():
                 for name, code in SYMBOLS.items():
                     try:
                         analyze_and_signal(name, code, data)
-                        data = load_data()
                         time.sleep(3)
                     except Exception as e:
                         print(f"שגיאה ב{name}: {e}", flush=True)
 
                 monitor_open_trades(data)
-                data = load_data()
+
+                # ניסיון חוזר לדחיפה ל-Gist אם שמירה קודמת נכשלה
+                if _gist_dirty and gist_enabled():
+                    print("[GIST] מנסה שוב לדחוף נתונים...", flush=True)
+                    gist_save(data)
+
                 print("סריקה הסתיימה — כפתורים ממשיכים לעבוד עד הסריקה הבאה.", flush=True)
 
             # --- דוח יומי (פעם ביום, בסוף שעות המסחר) ---
