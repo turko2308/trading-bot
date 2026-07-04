@@ -72,6 +72,12 @@ _trend_cache = {}
 # שער ADX מינימלי — מתחת לזה אין מגמה, לא נכנסים
 ADX_MIN = 20
 
+# ===== שני תיקונים שאומתו ב-backtest (04/07): =====
+# רצפת סטופ — מינימום מרחק גם כש-ATR נמוך, שלא לשבת בתוך הרעש
+STOP_FLOOR_PCT = 0.35
+# תקרת מתיחה — לא נכנסים כשהמחיר רחוק מדי מה-EMA (מאוחר מדי להצטרף)
+MAX_STRETCH_PCT = 1.2
+
 # ניקיון נתונים — שלא יתנפחו לנצח
 MAX_STORED_TRADES = 300
 DAILY_STATS_KEEP_DAYS = 90
@@ -636,6 +642,10 @@ def analyze_and_signal(symbol_name, symbol_code, data):
     if trend["allowed"] == "none":
         print(f"[{symbol_name}] מדלג: דשדוש ({trend['deviation_pct']:+.2f}% מ-EMA50)", flush=True)
         return
+    # תקרת מתיחה: המחיר רחוק מדי מה-EMA = מאוחר מדי להצטרף למגמה
+    if MAX_STRETCH_PCT is not None and abs(trend["deviation_pct"]) > MAX_STRETCH_PCT:
+        print(f"[{symbol_name}] מדלג: מתוח מדי ({trend['deviation_pct']:+.2f}% מ-EMA50, תקרה {MAX_STRETCH_PCT}%)", flush=True)
+        return
 
     direction = "קנייה" if trend["allowed"] == "long" else "מכירה"
     is_long = (direction == "קנייה")
@@ -723,6 +733,9 @@ def analyze_and_signal(symbol_name, symbol_code, data):
         stop_distance = atr * 1.5
     else:
         stop_distance = current * 0.005
+    # רצפת סטופ: מינימום 0.35% מהמחיר, שהסטופ לא יישב בתוך הרעש
+    if STOP_FLOOR_PCT is not None:
+        stop_distance = max(stop_distance, current * STOP_FLOOR_PCT / 100)
 
     entry_price = round(current, 2)
     tp2_mult = 4 if stars >= 4 else 3
@@ -1010,10 +1023,10 @@ def run_backtest():
     date_from = m15[0]["t"].strftime("%d/%m")
     date_to = m15[-1]["t"].strftime("%d/%m")
 
-    base = _simulate(m15, h1)
-    floor = _simulate(m15, h1, stop_floor_pct=0.35)
-    stretch = _simulate(m15, h1, max_stretch_pct=1.2)
-    both = _simulate(m15, h1, stop_floor_pct=0.35, max_stretch_pct=1.2)
+    base = _simulate(m15, h1, stop_floor_pct=STOP_FLOOR_PCT, max_stretch_pct=MAX_STRETCH_PCT)
+    no_floor = _simulate(m15, h1, max_stretch_pct=MAX_STRETCH_PCT)
+    no_stretch = _simulate(m15, h1, stop_floor_pct=STOP_FLOOR_PCT)
+    neither = _simulate(m15, h1)
 
     def block(name, r):
         return (
@@ -1026,10 +1039,10 @@ def run_backtest():
     return (
         f"📊 <b>בדיקת עבר — {date_from} עד {date_to}</b>\n"
         f"(מדמה כניסה לכל איתות, גודל {POSITION_SIZE_OZ}oz)\n\n"
-        + block("⚙️ הלוגיקה הנוכחית:", base) + "\n"
-        + block("🧪 עם רצפת סטופ 0.35%:", floor) + "\n"
-        + block("🧪 בלי כניסות מתוחות (>1.2% מ-EMA):", stretch) + "\n"
-        + block("🧪 שני התיקונים יחד:", both) + "\n"
+        + block("⚙️ הלוגיקה החיה (רצפת סטופ + תקרת מתיחה):", base) + "\n"
+        + block("🧪 בלי רצפת הסטופ:", no_floor) + "\n"
+        + block("🧪 בלי תקרת המתיחה:", no_stretch) + "\n"
+        + block("🧪 בלי שניהם (הלוגיקה הישנה):", neither) + "\n"
         f"💡 ⏰ = עסקאות שנסגרו בתום 6 שעות במחיר השוק"
     )
 
@@ -1353,7 +1366,7 @@ def send_daily_report(data):
 # לולאה ראשית
 # ============================================================
 def main():
-    print("🤖 בוט מסחר מופעל! [גרסה 3.1 — תיקון כפתורים]", flush=True)
+    print("🤖 בוט מסחר מופעל! [גרסה 3.2 — רצפת סטופ + תקרת מתיחה]", flush=True)
     print(f"TOKEN exists: {bool(TELEGRAM_TOKEN)}", flush=True)
     print(f"CHAT_ID: {CHAT_ID}", flush=True)
     print(f"GIST configured: {gist_enabled()}", flush=True)
@@ -1371,7 +1384,7 @@ def main():
         storage_line = "⚠️ אחסון זמני בלבד (/tmp) — הגדר GIST_ID + GIST_TOKEN ב-Render"
 
     send_telegram(
-        "🤖 <b>בוט המסחר הופעל!</b> (גרסה 3.1)\n\n"
+        "🤖 <b>בוט המסחר הופעל!</b> (גרסה 3.2)\n\n"
         "📊 סורק: זהב (XAU/USD)\n"
         "⏰ כל 10 דקות | 🕐 08:00—22:00 (ישראל)\n\n"
         "🧭 <b>מסחר עם המגמה בלבד</b>\n"
