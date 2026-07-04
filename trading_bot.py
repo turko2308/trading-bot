@@ -1033,7 +1033,10 @@ def run_backtest():
         f"💡 ⏰ = עסקאות שנסגרו בתום 6 שעות במחיר השוק"
     )
 
-
+# ============================================================
+# טיפול בתגובות משתמש
+# ============================================================
+def handle_callbacks(data, last_update_id):
     updates = get_updates(last_update_id + 1)
     for update in updates:
         last_update_id = update["update_id"]
