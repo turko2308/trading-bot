@@ -865,12 +865,22 @@ def _fetch_history(symbol, interval, outputsize):
         print(f"[BACKTEST] exception: {e}", flush=True)
         return None
 
-def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None):
+def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None,
+              deadzone=None, rsi_extreme_block=False,
+              limit_entry_pct=None, last_entry_hour=None):
     """
     מדמה את הלוגיקה החיה על נתוני העבר.
-    stop_floor_pct: רצפת סטופ באחוזים (למשל 0.35) — לבדיקת ההשערה שהסטופ צמוד מדי.
-    max_stretch_pct: תקרת מתיחה מה-EMA (למשל 1.2) — לא נכנסים כשהמחיר רחוק מדי.
+    stop_floor_pct: רצפת סטופ באחוזים (למשל 0.35).
+    max_stretch_pct: תקרת מתיחה מה-EMA (למשל 1.2).
+    deadzone: דדזון מגמה בשבר עשרוני (ברירת מחדל TREND_DEADZONE=0.003). וריאנט 1.
+    rsi_extreme_block: True = ‏RSI<=25 חוסם שורט, RSI>=75 חוסם לונג (חסימה קשה במקום קנס). וריאנט 7.
+    limit_entry_pct: כניסה בהמתנה — לימיט במרחק X% מהמחיר לכיוון הסטופ (למשל 0.15).
+                     הלימיט תקף LIMIT_EXPIRY_CANDLES נרות; לא מולא — אין עסקה. וריאנט 5.
+    last_entry_hour: אין כניסות חדשות משעה זו (למשל 19). המעקב על פתוחות נמשך. וריאנט 6.
     """
+    LIMIT_EXPIRY_CANDLES = 4  # לימיט חי שעה (4 נרות 15 דק')
+    if deadzone is None:
+        deadzone = TREND_DEADZONE
     h_closes = [c["c"] for c in h1]
     h_ema = calc_ema_series(h_closes, TREND_EMA_PERIOD)
     h_times = [c["t"] for c in h1]
@@ -881,6 +891,8 @@ def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None):
     times = [c["t"] for c in m15]
 
     open_trades = []
+    pending_limits = []  # וריאנט 5: הזמנות לימיט שממתינות למילוי
+    expired_limits = 0   # וריאנט 5: איתותים שהלימיט שלהם פקע בלי מילוי
     closed = []          # {"result","pnl","stars","day"}
     last_signal_time = None
     daily_signals = {}
@@ -889,6 +901,33 @@ def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None):
     for i in range(50, len(m15)):
         t = times[i]
         day = t.strftime("%Y-%m-%d")
+
+        # --- וריאנט 5: בדיקת מילוי/פקיעה של לימיטים ממתינים ---
+        if pending_limits:
+            still_pending = []
+            for p in pending_limits:
+                if i - p["signal_i"] > LIMIT_EXPIRY_CANDLES:
+                    expired_limits += 1
+                    continue  # פקע בלי מילוי — אין עסקה
+                p_long = p["dir"] == "long"
+                filled = (lows[i] <= p["limit"]) if p_long else (highs[i] >= p["limit"])
+                if not filled:
+                    still_pending.append(p)
+                    continue
+                entry = p["limit"]
+                stop_distance = p["stop_distance"]
+                stop = entry - stop_distance if p_long else entry + stop_distance
+                target = entry + stop_distance * 2 if p_long else entry - stop_distance * 2
+                # שמרני: אם נר המילוי נגע גם בסטופ — נספר כהפסד מיידי
+                stop_same = (lows[i] <= stop) if p_long else (highs[i] >= stop)
+                if stop_same:
+                    closed.append({"result": "loss",
+                                   "pnl": -(points_to_ils(stop_distance) + SPREAD_COST_ILS),
+                                   "stars": p["stars"], "day": day})
+                else:
+                    open_trades.append({"dir": p["dir"], "entry": entry, "stop": stop,
+                                        "target": target, "time": t, "stars": p["stars"]})
+            pending_limits = still_pending
 
         # --- סגירת עסקאות פתוחות מול הנר הנוכחי (סטופ קודם) ---
         still_open = []
@@ -916,6 +955,8 @@ def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None):
         # --- תנאי כניסה (זהים לחיים) ---
         if not (8 <= t.hour < 22):
             continue
+        if last_entry_hour is not None and t.hour >= last_entry_hour:
+            continue  # וריאנט 6: אין כניסות חדשות בערב
         if daily_signals.get(day, 0) >= MAX_ENTERED_PER_DAY:
             continue
         if len(open_trades) >= MAX_PARALLEL_TRADES:
@@ -936,9 +977,9 @@ def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None):
         ema = h_ema[j]
         current = closes[i]
         dev = (current - ema) / ema
-        if dev > TREND_DEADZONE:
+        if dev > deadzone:
             direction = "long"
-        elif dev < -TREND_DEADZONE:
+        elif dev < -deadzone:
             direction = "short"
         else:
             continue
@@ -956,6 +997,12 @@ def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None):
             continue
 
         rsi = calc_rsi(w_c)
+        # וריאנט 7: RSI קיצוני חוסם כניסה לגמרי (במקום קנס כוכב)
+        if rsi_extreme_block and rsi is not None:
+            if is_long and rsi >= 75:
+                continue
+            if (not is_long) and rsi <= 25:
+                continue
         macd_line, macd_sig = calc_macd(w_c)
         bb_up, bb_mid, bb_lo = calc_bollinger(w_c)
         atr = calc_atr(w_h, w_l, w_c)
@@ -993,11 +1040,19 @@ def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None):
         stop_distance = atr * 1.5 if atr else current * 0.005
         if stop_floor_pct is not None:
             stop_distance = max(stop_distance, current * stop_floor_pct / 100)
-        stop = current - stop_distance if is_long else current + stop_distance
-        target = current + stop_distance * 2 if is_long else current - stop_distance * 2
 
-        open_trades.append({"dir": direction, "entry": current, "stop": stop,
-                            "target": target, "time": t, "stars": stars})
+        if limit_entry_pct is not None:
+            # וריאנט 5: במקום כניסת שוק — לימיט לכיוון הסטופ. לא מולא = אין עסקה
+            limit = current - current * limit_entry_pct / 100 if is_long \
+                else current + current * limit_entry_pct / 100
+            pending_limits.append({"dir": direction, "limit": limit,
+                                   "stop_distance": stop_distance,
+                                   "stars": stars, "signal_i": i})
+        else:
+            stop = current - stop_distance if is_long else current + stop_distance
+            target = current + stop_distance * 2 if is_long else current - stop_distance * 2
+            open_trades.append({"dir": direction, "entry": current, "stop": stop,
+                                "target": target, "time": t, "stars": stars})
         daily_signals[day] = daily_signals.get(day, 0) + 1
         last_signal_time = t
 
@@ -1009,7 +1064,8 @@ def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None):
     win_rate = f"{round(len(wins) / decided * 100)}%" if decided else "—"
     return {
         "trades": len(closed), "wins": len(wins), "losses": len(losses),
-        "timeouts": len(touts), "win_rate": win_rate, "pnl": total_pnl
+        "timeouts": len(touts), "win_rate": win_rate, "pnl": total_pnl,
+        "unfilled": expired_limits
     }
 
 def run_backtest():
@@ -1023,28 +1079,44 @@ def run_backtest():
     date_from = m15[0]["t"].strftime("%d/%m")
     date_to = m15[-1]["t"].strftime("%d/%m")
 
-    base = _simulate(m15, h1, stop_floor_pct=STOP_FLOOR_PCT, max_stretch_pct=MAX_STRETCH_PCT)
-    no_floor = _simulate(m15, h1, max_stretch_pct=MAX_STRETCH_PCT)
-    no_stretch = _simulate(m15, h1, stop_floor_pct=STOP_FLOOR_PCT)
-    neither = _simulate(m15, h1)
+    live = dict(stop_floor_pct=STOP_FLOOR_PCT, max_stretch_pct=MAX_STRETCH_PCT)
 
-    def block(name, r):
+    variants = [
+        ("⚙️ בסיס — הלוגיקה החיה (3.2)", {}),
+        ("1️⃣ דדזון 0.5%",                 {"deadzone": 0.005}),
+        ("1️⃣ דדזון 0.6%",                 {"deadzone": 0.006}),
+        ("5️⃣ כניסת לימיט 0.15%",          {"limit_entry_pct": 0.15}),
+        ("5️⃣ כניסת לימיט 0.25%",          {"limit_entry_pct": 0.25}),
+        ("7️⃣ חסימת RSI קיצוני",           {"rsi_extreme_block": True}),
+        ("6️⃣ אין כניסות אחרי 19:00",      {"last_entry_hour": 19}),
+        ("6️⃣ אין כניסות אחרי 20:00",      {"last_entry_hour": 20}),
+    ]
+
+    def block(name, r, base_pnl=None):
+        diff = ""
+        if base_pnl is not None:
+            diff = f" ({r['pnl'] - base_pnl:+.0f} מול הבסיס)"
+        extra = ""
+        if r.get("unfilled"):
+            extra = f" | 🚫 לא מולאו: {r['unfilled']}"
         return (
             f"<b>{name}</b>\n"
-            f"🔔 עסקאות: {r['trades']} | ✅ {r['wins']} | ❌ {r['losses']}"
-            + (f" | ⏰ {r['timeouts']}" if r['timeouts'] else "") + "\n"
-            f"📊 הצלחה: {r['win_rate']} | 💰 {r['pnl']:+.2f} ש\"ח\n"
+            f"🔔 {r['trades']} עסק' | ✅ {r['wins']} | ❌ {r['losses']}"
+            + (f" | ⏰ {r['timeouts']}" if r['timeouts'] else "") + extra + "\n"
+            f"📊 {r['win_rate']} | 💰 {r['pnl']:+.2f} ש\"ח{diff}\n"
         )
 
-    return (
-        f"📊 <b>בדיקת עבר — {date_from} עד {date_to}</b>\n"
-        f"(מדמה כניסה לכל איתות, גודל {POSITION_SIZE_OZ}oz)\n\n"
-        + block("⚙️ הלוגיקה החיה (רצפת סטופ + תקרת מתיחה):", base) + "\n"
-        + block("🧪 בלי רצפת הסטופ:", no_floor) + "\n"
-        + block("🧪 בלי תקרת המתיחה:", no_stretch) + "\n"
-        + block("🧪 בלי שניהם (הלוגיקה הישנה):", neither) + "\n"
-        f"💡 ⏰ = עסקאות שנסגרו בתום 6 שעות במחיר השוק"
-    )
+    parts = [f"📊 <b>בדיקת עבר — {date_from} עד {date_to}</b>\n"
+             f"(וריאנט אחד משתנה בכל שורה, השאר = לוגיקה חיה)\n"]
+    base_pnl = None
+    for name, overrides in variants:
+        kw = dict(live); kw.update(overrides)
+        r = _simulate(m15, h1, **kw)
+        parts.append(block(name, r, base_pnl))
+        if base_pnl is None:
+            base_pnl = r["pnl"]
+    parts.append("💡 ⏰ = נסגרו בתום 6 שעות | 🚫 = איתותי לימיט שפקעו בלי מילוי (שעה)")
+    return "\n".join(parts)
 
 # ============================================================
 # טיפול בתגובות משתמש
