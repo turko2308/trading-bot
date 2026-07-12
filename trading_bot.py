@@ -42,6 +42,9 @@ SYMBOLS = {
 TRADING_HOURS = {
     "זהב": {"start": 8, "end": 22}
 }
+# 3.3: אין איתותים חדשים משעה זו (ערב = כניסות מפסידות; backtest 11/07: ‏+203 מול הבסיס).
+# המוניטור על עסקאות פתוחות ממשיך כרגיל 24/7.
+LAST_ENTRY_HOUR = 19
 
 # ===== מגבלות איתותים =====
 MAX_ENTERED_PER_DAY = 10
@@ -604,6 +607,11 @@ def analyze_and_signal(symbol_name, symbol_code, data):
         print(f"[{symbol_name}] לא בשעות מסחר", flush=True)
         return
 
+    # 3.3: חיתוך ערב — אין איתותים חדשים אחרי LAST_ENTRY_HOUR (מוניטור ממשיך)
+    if now_il().hour >= LAST_ENTRY_HOUR:
+        print(f"[{symbol_name}] אחרי {LAST_ENTRY_HOUR}:00 — אין איתותים חדשים (חיתוך ערב 3.3)", flush=True)
+        return
+
     can, reason = can_trade(symbol_name, data)
     if not can:
         print(f"[{symbol_name}] לא שולח: {reason}", flush=True)
@@ -654,6 +662,16 @@ def analyze_and_signal(symbol_name, symbol_code, data):
     if adx is not None and adx < ADX_MIN:
         print(f"[{symbol_name}] מדלג: ADX {adx} < {ADX_MIN} (מגמה חלשה)", flush=True)
         return
+
+    # 3.3: חסימת RSI קיצוני — מומנטום מוצה, מאוחר מדי להצטרף (backtest 11/07: ‏+179 מול הבסיס)
+    # זהה לוריאנט 7 במנוע ה-backtest: לונג נחסם ב-RSI>=75, שורט נחסם ב-RSI<=25
+    if rsi is not None:
+        if is_long and rsi >= 75:
+            print(f"[{symbol_name}] מדלג: RSI {rsi} >= 75 — קיצון, חסימה קשה (3.3)", flush=True)
+            return
+        if (not is_long) and rsi <= 25:
+            print(f"[{symbol_name}] מדלג: RSI {rsi} <= 25 — קיצון, חסימה קשה (3.3)", flush=True)
+            return
 
     weights = data["indicator_weights"]
     signals = []
@@ -867,7 +885,8 @@ def _fetch_history(symbol, interval, outputsize):
 
 def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None,
               deadzone=None, rsi_extreme_block=False,
-              limit_entry_pct=None, last_entry_hour=None):
+              limit_entry_pct=None, last_entry_hour=None,
+              target_mult=2.0, breakeven_frac=None):
     """
     מדמה את הלוגיקה החיה על נתוני העבר.
     stop_floor_pct: רצפת סטופ באחוזים (למשל 0.35).
@@ -877,6 +896,8 @@ def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None,
     limit_entry_pct: כניסה בהמתנה — לימיט במרחק X% מהמחיר לכיוון הסטופ (למשל 0.15).
                      הלימיט תקף LIMIT_EXPIRY_CANDLES נרות; לא מולא — אין עסקה. וריאנט 5.
     last_entry_hour: אין כניסות חדשות משעה זו (למשל 19). המעקב על פתוחות נמשך. וריאנט 6.
+    target_mult: טארגט כמכפלת מרחק הסטופ (ברירת מחדל 2.0 כמו בחי). חקר אחוז זכייה.
+    breakeven_frac: אחרי שהמחיר עבר חלק זה מהדרך לטארגט (למשל 0.5) — הסטופ זז לכניסה. וריאנט 4.
     """
     LIMIT_EXPIRY_CANDLES = 4  # לימיט חי שעה (4 נרות 15 דק')
     if deadzone is None:
@@ -917,7 +938,7 @@ def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None,
                 entry = p["limit"]
                 stop_distance = p["stop_distance"]
                 stop = entry - stop_distance if p_long else entry + stop_distance
-                target = entry + stop_distance * 2 if p_long else entry - stop_distance * 2
+                target = entry + stop_distance * target_mult if p_long else entry - stop_distance * target_mult
                 # שמרני: אם נר המילוי נגע גם בסטופ — נספר כהפסד מיידי
                 stop_same = (lows[i] <= stop) if p_long else (highs[i] >= stop)
                 if stop_same:
@@ -937,9 +958,14 @@ def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None,
             target_hit = (highs[i] >= tr["target"]) if is_long else (lows[i] <= tr["target"])
             timed_out = (t - tr["time"]).total_seconds() >= TRADE_TIMEOUT_HOURS * 3600
             if stop_hit:
-                d_ = abs(tr["entry"] - tr["stop"])
-                closed.append({"result": "loss", "pnl": -(points_to_ils(d_) + SPREAD_COST_ILS),
-                               "stars": tr["stars"], "day": day})
+                if tr.get("be"):
+                    # וריאנט 4: הסטופ כבר הוזז לכניסה — יציאה באפס פחות ספרד
+                    closed.append({"result": "be", "pnl": -SPREAD_COST_ILS,
+                                   "stars": tr["stars"], "day": day})
+                else:
+                    d_ = abs(tr["entry"] - tr["stop"])
+                    closed.append({"result": "loss", "pnl": -(points_to_ils(d_) + SPREAD_COST_ILS),
+                                   "stars": tr["stars"], "day": day})
             elif target_hit:
                 d_ = abs(tr["target"] - tr["entry"])
                 closed.append({"result": "win", "pnl": points_to_ils(d_) - SPREAD_COST_ILS,
@@ -949,6 +975,13 @@ def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None,
                 pnl = points_to_ils(diff) - SPREAD_COST_ILS if diff > 0 else -(points_to_ils(abs(diff)) + SPREAD_COST_ILS)
                 closed.append({"result": "timeout", "pnl": pnl, "stars": tr["stars"], "day": day})
             else:
+                # וריאנט 4: break-even — שמרני: הטריגר מהנר הנוכחי נכנס לתוקף מהנר הבא
+                if breakeven_frac is not None and not tr.get("be"):
+                    trigger = tr["entry"] + (tr["target"] - tr["entry"]) * breakeven_frac
+                    reached = (highs[i] >= trigger) if is_long else (lows[i] <= trigger)
+                    if reached:
+                        tr["stop"] = tr["entry"]
+                        tr["be"] = True
                 still_open.append(tr)
         open_trades = still_open
 
@@ -1050,7 +1083,7 @@ def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None,
                                    "stars": stars, "signal_i": i})
         else:
             stop = current - stop_distance if is_long else current + stop_distance
-            target = current + stop_distance * 2 if is_long else current - stop_distance * 2
+            target = current + stop_distance * target_mult if is_long else current - stop_distance * target_mult
             open_trades.append({"dir": direction, "entry": current, "stop": stop,
                                 "target": target, "time": t, "stars": stars})
         daily_signals[day] = daily_signals.get(day, 0) + 1
@@ -1059,13 +1092,14 @@ def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None,
     wins = [c for c in closed if c["result"] == "win"]
     losses = [c for c in closed if c["result"] == "loss"]
     touts = [c for c in closed if c["result"] == "timeout"]
+    bes = [c for c in closed if c["result"] == "be"]
     total_pnl = round(sum(c["pnl"] for c in closed), 2)
     decided = len(wins) + len(losses)
     win_rate = f"{round(len(wins) / decided * 100)}%" if decided else "—"
     return {
         "trades": len(closed), "wins": len(wins), "losses": len(losses),
         "timeouts": len(touts), "win_rate": win_rate, "pnl": total_pnl,
-        "unfilled": expired_limits
+        "unfilled": expired_limits, "be": len(bes)
     }
 
 def run_backtest():
@@ -1079,19 +1113,18 @@ def run_backtest():
     date_from = m15[0]["t"].strftime("%d/%m")
     date_to = m15[-1]["t"].strftime("%d/%m")
 
-    live = dict(stop_floor_pct=STOP_FLOOR_PCT, max_stretch_pct=MAX_STRETCH_PCT)
+    live = dict(stop_floor_pct=STOP_FLOOR_PCT, max_stretch_pct=MAX_STRETCH_PCT,
+                rsi_extreme_block=True, last_entry_hour=LAST_ENTRY_HOUR)
 
     variants = [
-        ("⚙️ בסיס — הלוגיקה החיה (3.2)", {}),
-        ("1️⃣ דדזון 0.5%",                 {"deadzone": 0.005}),
-        ("1️⃣ דדזון 0.6%",                 {"deadzone": 0.006}),
-        ("5️⃣ כניסת לימיט 0.15%",          {"limit_entry_pct": 0.15}),
-        ("5️⃣ כניסת לימיט 0.25%",          {"limit_entry_pct": 0.25}),
-        ("7️⃣ חסימת RSI קיצוני",           {"rsi_extreme_block": True}),
-        ("6️⃣ אין כניסות אחרי 19:00",      {"last_entry_hour": 19}),
-        ("6️⃣ אין כניסות אחרי 20:00",      {"last_entry_hour": 20}),
-        ("🏆 קומבו: חסימת RSI + אין כניסות אחרי 19:00",
-         {"rsi_extreme_block": True, "last_entry_hour": 19}),
+        ("⚙️ בסיס — הלוגיקה החיה (3.3)", {}),
+        ("📉 גרסה 3.2 הישנה (השוואה)",
+         {"rsi_extreme_block": False, "last_entry_hour": None}),
+        ("🎯 טארגט 1.5× (במקום 2×)",      {"target_mult": 1.5}),
+        ("🎯 טארגט 1.0× (יחס 1:1)",       {"target_mult": 1.0}),
+        ("4️⃣ Break-even אחרי 50% מהדרך",  {"breakeven_frac": 0.5}),
+        ("🎯+4️⃣ טארגט 1.5× + Break-even 50%",
+         {"target_mult": 1.5, "breakeven_frac": 0.5}),
     ]
 
     def block(name, r, base_pnl=None):
@@ -1100,7 +1133,9 @@ def run_backtest():
             diff = f" ({r['pnl'] - base_pnl:+.0f} מול הבסיס)"
         extra = ""
         if r.get("unfilled"):
-            extra = f" | 🚫 לא מולאו: {r['unfilled']}"
+            extra += f" | 🚫 לא מולאו: {r['unfilled']}"
+        if r.get("be"):
+            extra += f" | 🤝 יצאו באפס: {r['be']}"
         return (
             f"<b>{name}</b>\n"
             f"🔔 {r['trades']} עסק' | ✅ {r['wins']} | ❌ {r['losses']}"
@@ -1109,7 +1144,7 @@ def run_backtest():
         )
 
     parts = [f"📊 <b>בדיקת עבר — {date_from} עד {date_to}</b>\n"
-             f"(וריאנט אחד משתנה בכל שורה, השאר = לוגיקה חיה)\n"]
+             f"(חקר אחוז זכייה: וריאנט אחד משתנה בכל שורה מול לוגיקת 3.3)\n"]
     base_pnl = None
     for name, overrides in variants:
         kw = dict(live); kw.update(overrides)
@@ -1117,7 +1152,7 @@ def run_backtest():
         parts.append(block(name, r, base_pnl))
         if base_pnl is None:
             base_pnl = r["pnl"]
-    parts.append("💡 ⏰ = נסגרו בתום 6 שעות | 🚫 = איתותי לימיט שפקעו בלי מילוי (שעה)")
+    parts.append("💡 אחוז = זכיות מתוך זכיות+הפסדים | ⏰ = תום 6 שעות | 🤝 = סטופ שהוזז לכניסה")
     return "\n".join(parts)
 
 # ============================================================
@@ -1440,7 +1475,7 @@ def send_daily_report(data):
 # לולאה ראשית
 # ============================================================
 def main():
-    print("🤖 בוט מסחר מופעל! [גרסה 3.2 — רצפת סטופ + תקרת מתיחה]", flush=True)
+    print("🤖 בוט מסחר מופעל! [גרסה 3.3 — חסימת RSI קיצוני + חיתוך ערב 19:00]", flush=True)
     print(f"TOKEN exists: {bool(TELEGRAM_TOKEN)}", flush=True)
     print(f"CHAT_ID: {CHAT_ID}", flush=True)
     print(f"GIST configured: {gist_enabled()}", flush=True)
@@ -1458,7 +1493,7 @@ def main():
         storage_line = "⚠️ אחסון זמני בלבד (/tmp) — הגדר GIST_ID + GIST_TOKEN ב-Render"
 
     send_telegram(
-        "🤖 <b>בוט המסחר הופעל!</b> (גרסה 3.2)\n\n"
+        "🤖 <b>בוט המסחר הופעל!</b> (גרסה 3.3)\n\n"
         "📊 סורק: זהב (XAU/USD)\n"
         "⏰ כל 10 דקות | 🕐 08:00—22:00 (ישראל)\n\n"
         "🧭 <b>מסחר עם המגמה בלבד</b>\n"
