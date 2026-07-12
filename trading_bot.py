@@ -1090,6 +1090,8 @@ def run_backtest():
         ("7️⃣ חסימת RSI קיצוני",           {"rsi_extreme_block": True}),
         ("6️⃣ אין כניסות אחרי 19:00",      {"last_entry_hour": 19}),
         ("6️⃣ אין כניסות אחרי 20:00",      {"last_entry_hour": 20}),
+        ("🏆 קומבו: חסימת RSI + אין כניסות אחרי 19:00",
+         {"rsi_extreme_block": True, "last_entry_hour": 19}),
     ]
 
     def block(name, r, base_pnl=None):
