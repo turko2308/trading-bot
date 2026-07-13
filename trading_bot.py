@@ -12,6 +12,8 @@ try:
 except Exception:
     IL_TZ = None
 
+_runtime = {"last_scan": None}  # 3.4: מצב ריצה ל-/status (לא נשמר ב-Gist)
+
 def now_il():
     """שעון ישראל תמיד — לא תלוי באזור הזמן של השרת (Render = UTC)."""
     if IL_TZ:
@@ -45,6 +47,9 @@ TRADING_HOURS = {
 # 3.3: אין איתותים חדשים משעה זו (ערב = כניסות מפסידות; backtest 11/07: ‏+203 מול הבסיס).
 # המוניטור על עסקאות פתוחות ממשיך כרגיל 24/7.
 LAST_ENTRY_HOUR = 19
+# 3.4: תזכורת חוזרת על סגירה שלא אושרה — כל 30 דק', עד 5 פעמים
+REMINDER_MINUTES = 30
+MAX_REMINDERS = 5
 
 # ===== מגבלות איתותים =====
 MAX_ENTERED_PER_DAY = 10
@@ -266,6 +271,12 @@ def prune_data(data):
         closed = [t for t in trades if t.get("status") != "open"]
         keep = MAX_STORED_TRADES - len(open_trades)
         data["trades"] = closed[-keep:] + open_trades if keep > 0 else open_trades
+    shadows = data.get("shadow_trades", [])
+    if len(shadows) > MAX_STORED_TRADES:
+        open_sh = [t for t in shadows if t.get("status") == "open"]
+        closed_sh = [t for t in shadows if t.get("status") != "open"]
+        keep = MAX_STORED_TRADES - len(open_sh)
+        data["shadow_trades"] = (closed_sh[-keep:] + open_sh) if keep > 0 else open_sh
     daily = data.get("daily_stats", {})
     if len(daily) > DAILY_STATS_KEEP_DAYS:
         for k in sorted(daily.keys())[:-DAILY_STATS_KEEP_DAYS]:
@@ -603,18 +614,11 @@ def check_open_trades_for_symbol(symbol_name, data):
 # ניתוח ושליחת סיגנל — trend-following עם פילטר מגמה קשה
 # ============================================================
 def analyze_and_signal(symbol_name, symbol_code, data):
+    """3.4: שני מסלולים — 'עיני המערכת' (סימולציה, רק שערי איכות) מול 'התיק שלך' (כל המגבלות).
+    שערי איכות: מגמה, מתיחה, ADX, חסימת RSI, ניקוד. שערי תפעול: חיתוך ערב, ברייקר, מגבלות יומיות,
+    סלוטים, cooldown. איתות שעובר איכות תמיד נרשם בסימולציה; רק אם עבר גם תפעול — נשלח אליך."""
     if not is_trading_hours(symbol_name):
         print(f"[{symbol_name}] לא בשעות מסחר", flush=True)
-        return
-
-    # 3.3: חיתוך ערב — אין איתותים חדשים אחרי LAST_ENTRY_HOUR (מוניטור ממשיך)
-    if now_il().hour >= LAST_ENTRY_HOUR:
-        print(f"[{symbol_name}] אחרי {LAST_ENTRY_HOUR}:00 — אין איתותים חדשים (חיתוך ערב 3.3)", flush=True)
-        return
-
-    can, reason = can_trade(symbol_name, data)
-    if not can:
-        print(f"[{symbol_name}] לא שולח: {reason}", flush=True)
         return
 
     prices_data = get_prices(symbol_code)
@@ -771,6 +775,63 @@ def analyze_and_signal(symbol_name, symbol_code, data):
         target2 = round(current - stop_distance * tp2_mult, 2)
 
     now = now_il()
+
+    # ================= 3.4: מסלול הסימולציה ("עיני המערכת") =================
+    # כל איתות שעבר את שערי האיכות נרשם כאן — גם אם התפעול יחסום אותו בהמשך.
+    # cooldown נפרד של 30 דק' לסימולציה, כדי לא לרשום את אותו מצב שוק 4 פעמים.
+    shadow = None
+    shadow_list = data.setdefault("shadow_trades", [])
+    last_sh = data.setdefault("shadow_last_signal", {}).get(symbol_name)
+    sh_cooldown_ok = True
+    if last_sh:
+        try:
+            sh_cooldown_ok = (now - datetime.datetime.fromisoformat(last_sh)).total_seconds() >= SIGNAL_COOLDOWN_MINUTES * 60
+        except Exception:
+            sh_cooldown_ok = True
+    if sh_cooldown_ok:
+        today = get_today_key()
+        if today not in data["daily_stats"]:
+            data["daily_stats"][today] = {}
+        data["daily_stats"][today]["shadow_seq"] = data["daily_stats"][today].get("shadow_seq", 0) + 1
+        shadow = {
+            "id": make_trade_id("SH" + symbol_name, now.strftime('%H%M%S')),
+            "number": f"S{data['daily_stats'][today]['shadow_seq']}",
+            "symbol": symbol_name,
+            "direction": direction,
+            "entry": entry_price,
+            "stop": stop,
+            "target1": target1,
+            "stars": stars,
+            "time": now.isoformat(),
+            "timeout": (now + datetime.timedelta(hours=TRADE_TIMEOUT_HOURS)).isoformat(),
+            "status": "open",
+            "blocked_reason": None   # ימולא אם התפעול חוסם
+        }
+        shadow_list.append(shadow)
+        data["shadow_last_signal"][symbol_name] = now.isoformat()
+
+    # ================= 3.4: שערי תפעול (רק על "התיק שלך") =================
+    op_block = None
+    if now.hour >= LAST_ENTRY_HOUR:
+        op_block = f"חיתוך ערב ({LAST_ENTRY_HOUR}:00)"
+    else:
+        can, reason = can_trade(symbol_name, data)
+        if not can:
+            op_block = reason
+
+    if op_block:
+        if shadow:
+            shadow["blocked_reason"] = op_block
+        today = get_today_key()
+        if today not in data["daily_stats"]:
+            data["daily_stats"][today] = {}
+        blocked = data["daily_stats"][today].setdefault("blocked", {})
+        blocked[op_block] = blocked.get(op_block, 0) + 1
+        save_data(data)
+        print(f"[{symbol_name}] איתות איכותי נחסם תפעולית: {op_block}"
+              + (f" (נרשם בסימולציה {shadow['number']})" if shadow else ""), flush=True)
+        return
+
     timeout_time = (now + datetime.timedelta(hours=TRADE_TIMEOUT_HOURS)).strftime("%H:%M")
 
     # מספור יומי: מתאפס כל יום, התווית כוללת תאריך (למשל '03/07 #2')
@@ -842,6 +903,8 @@ def analyze_and_signal(symbol_name, symbol_code, data):
     if today not in data["daily_stats"]:
         data["daily_stats"][today] = {}
     data["daily_stats"][today]["signals_sent"] = data["daily_stats"][today].get("signals_sent", 0) + 1
+    if shadow:
+        shadow["linked_real"] = True  # האיתות הזה גם נשלח בפועל
 
     save_data(data)
     print(f"[{now.strftime('%H:%M')}] ✅ איתות {trade_num}: {symbol_name} {direction} {stars}⭐", flush=True)
@@ -1158,6 +1221,51 @@ def run_backtest():
 # ============================================================
 # טיפול בתגובות משתמש
 # ============================================================
+def _retro_check(data, trade, signal_dt, now):
+    """3.4: בלחיצת 'נכנסתי' מאוחרת — בודק אם הסטופ/טארגט כבר נפגעו מאז האיתות.
+    אם כן: סוגר מיד עם התוצאה הנכונה ו-close_time של נר הפגיעה. מחזיר True אם נסגרה."""
+    symbol_code = SYMBOLS.get(trade["symbol"])
+    if not symbol_code:
+        return False
+    need = int((now - signal_dt).total_seconds() // (15 * 60)) + 2
+    pd = get_prices(symbol_code, outputsize=min(50, max(5, need)))
+    if not pd or not pd.get("closes") or not pd.get("last_time"):
+        return False
+    n = len(pd["closes"])
+    last_t = pd["last_time"]
+    is_long = trade["direction"] == "קנייה"
+    for i in range(n):
+        candle_t = last_t - datetime.timedelta(minutes=15 * (n - 1 - i))
+        if candle_t <= signal_dt:
+            continue
+        hi, lo = pd["highs"][i], pd["lows"][i]
+        stop_hit = (lo <= trade["stop"]) if is_long else (hi >= trade["stop"])
+        target_hit = (hi >= trade["target1"]) if is_long else (lo <= trade["target1"])
+        if stop_hit:  # שמרני: סטופ קודם
+            loss = points_to_ils(abs(trade["entry"] - trade["stop"])) + SPREAD_COST_ILS
+            _finalize_trade(data, trade, "loss", -loss, close_dt=candle_t)
+            trade["ack"] = True  # המשתמש כאן עכשיו — אין צורך בתזכורות
+            send_telegram(
+                f"🛑 <b>עסקה {fmt_tn(trade.get('number','?'))} — הסטופ כבר נפגע בזמן שהיית עסוק</b>\n"
+                f"נסגרה רטרואקטיבית ({candle_t.strftime('%H:%M')})\n"
+                f"💸 {trade['pnl']} ש\"ח"
+            )
+            update_indicator_weights(data)
+            return True
+        if target_hit:
+            profit = points_to_ils(abs(trade["target1"] - trade["entry"])) - SPREAD_COST_ILS
+            _finalize_trade(data, trade, "win", profit, close_dt=candle_t)
+            trade["ack"] = True
+            send_telegram(
+                f"🎯 <b>עסקה {fmt_tn(trade.get('number','?'))} — הטארגט כבר נפגע בזמן שהיית עסוק!</b>\n"
+                f"נסגרה רטרואקטיבית ({candle_t.strftime('%H:%M')})\n"
+                f"💰 +{trade['pnl']} ש\"ח\n"
+                f"(אם אתה עדיין בפוזיציה בפלוס500 — סגור שם)"
+            )
+            update_indicator_weights(data)
+            return True
+    return False
+
 def handle_callbacks(data, last_update_id):
     updates = get_updates(last_update_id + 1)
     for update in updates:
@@ -1182,7 +1290,13 @@ def handle_callbacks(data, last_update_id):
                     send_telegram("⚠️ כבר נכנסת לעסקה הזו")
                     continue
                 now = now_il()
-                timeout = (now + datetime.timedelta(hours=TRADE_TIMEOUT_HOURS)).isoformat()
+                # 3.4: העסקה מעוגנת לזמן האיתות — לא לזמן הלחיצה.
+                # המשתמש נכנס בפועל בזמן האיתות ומאשר כשמתפנה.
+                try:
+                    signal_dt = datetime.datetime.fromisoformat(signal["time"])
+                except (KeyError, ValueError):
+                    signal_dt = now
+                timeout = (signal_dt + datetime.timedelta(hours=TRADE_TIMEOUT_HOURS)).isoformat()
                 num = signal.get("number", "?")
                 trade = {
                     "id": trade_id,
@@ -1194,7 +1308,8 @@ def handle_callbacks(data, last_update_id):
                     "target1": signal["target1"],
                     "target2": signal["target2"],
                     "stars": signal.get("stars"),
-                    "entry_time": now.isoformat(),
+                    "entry_time": signal_dt.isoformat(),
+                    "confirmed_time": now.isoformat(),
                     "timeout": timeout,
                     "status": "open",
                     "target_alerted": False,
@@ -1207,22 +1322,46 @@ def handle_callbacks(data, last_update_id):
                 if today not in data["daily_stats"]:
                     data["daily_stats"][today] = {}
                 data["daily_stats"][today]["entered"] = data["daily_stats"][today].get("entered", 0) + 1
+
+                # 3.4: אישור מאוחר — בדיקה רטרואקטיבית: אולי הסטופ/טארגט כבר נפגעו בינתיים?
+                late_min = (now - signal_dt).total_seconds() / 60
+                retro_closed = False
+                if late_min > 16:  # יותר מנר אחד של 15 דק'
+                    retro_closed = _retro_check(data, trade, signal_dt, now)
+
                 save_data(data)
-                keyboard = [[{"text": "🔒 סגרתי עסקה", "callback_data": f"cl_{trade_id}"}]]
-                send_telegram(
-                    f"✅ <b>עסקה {fmt_tn(num)} נפתחה — {signal['symbol']}</b>\n"
-                    f"כיוון: {'קנייה 🟢' if signal['direction'] == 'קנייה' else 'מכירה 🔴'}\n"
-                    f"כניסה: {signal['entry']} | סטופ: {signal['stop']}\n"
-                    f"🎯 טארגט 1: {signal['target1']}\n"
-                    f"⏰ תזכורת: {datetime.datetime.fromisoformat(timeout).strftime('%H:%M')}",
-                    keyboard
-                )
-                print(f"[CALLBACK] ✅ עסקה {fmt_tn(num)} נפתחה: {trade_id}", flush=True)
+                if not retro_closed:
+                    keyboard = [[{"text": "🔒 סגרתי עסקה", "callback_data": f"cl_{trade_id}"}]]
+                    late_note = f"\n⏱️ אושר {int(late_min)} דק' אחרי האיתות — העסקה נמדדת מזמן האיתות" if late_min > 16 else ""
+                    send_telegram(
+                        f"✅ <b>עסקה {fmt_tn(num)} נפתחה — {signal['symbol']}</b>\n"
+                        f"כיוון: {'קנייה 🟢' if signal['direction'] == 'קנייה' else 'מכירה 🔴'}\n"
+                        f"כניסה: {signal['entry']} | סטופ: {signal['stop']}\n"
+                        f"🎯 טארגט 1: {signal['target1']}\n"
+                        f"⏰ תזכורת: {datetime.datetime.fromisoformat(timeout).strftime('%H:%M')}"
+                        f"{late_note}",
+                        keyboard
+                    )
+                print(f"[CALLBACK] ✅ עסקה {fmt_tn(num)} נפתחה: {trade_id} (איחור {int(late_min)} דק')", flush=True)
 
             # ❌ דילגתי
             elif cbd.startswith("sk_"):
-                send_telegram("❌ דילגת — ממשיך לסרוק 👀")
+                today = get_today_key()
+                if today not in data["daily_stats"]:
+                    data["daily_stats"][today] = {}
+                data["daily_stats"][today]["skipped"] = data["daily_stats"][today].get("skipped", 0) + 1
+                save_data(data)
+                send_telegram("❌ דילגת — ממשיך לסרוק 👀 (הסימולציה עוקבת אחרי האיתות בשבילך)")
                 print(f"[CALLBACK] ❌ דילג: {cbd[3:]}", flush=True)
+
+            # 👍 אישור קבלה של סגירה אוטומטית (3.4)
+            elif cbd.startswith("ok_"):
+                trade_id = cbd[3:]
+                trade = next((t for t in data["trades"] if t["id"] == trade_id), None)
+                if trade:
+                    trade["ack"] = True
+                    save_data(data)
+                send_telegram("👍 נרשם")
 
             # 🔒 סגרתי עסקה (תפריט סגירה ידני)
             elif cbd.startswith("cl_"):
@@ -1239,12 +1378,17 @@ def handle_callbacks(data, last_update_id):
                 send_telegram(f"📊 <b>עסקה {fmt_tn(trade.get('number','?'))} — איך יצאת?</b>", keyboard)
                 print(f"[CALLBACK] 🔒 סגירה: {trade_id}", flush=True)
 
-            # תוצאה — רווח (טארגט 1 סוגר הכל)
+            # תוצאה — רווח (כפתור ישן/סגירה ידנית לפני פגיעה)
             elif cbd.startswith("rf_"):
                 trade_id = cbd[3:]
-                trade = next((t for t in data["trades"] if t["id"] == trade_id and t["status"] == "open"), None)
+                trade = next((t for t in data["trades"] if t["id"] == trade_id), None)
                 if not trade:
                     send_telegram("⚠️ לא נמצאה עסקה")
+                    continue
+                if trade["status"] == "closed":
+                    trade["ack"] = True
+                    save_data(data)
+                    send_telegram(f"👍 עסקה {fmt_tn(trade.get('number','?'))} כבר נסגרה אוטומטית ({trade.get('pnl')} ש\"ח) — נרשם")
                     continue
                 risk_distance = abs(trade["entry"] - trade["stop"])
                 reward_distance = abs(trade["target1"] - trade["entry"])
@@ -1276,12 +1420,17 @@ def handle_callbacks(data, last_update_id):
                 save_data(data)
                 send_telegram("💰 <b>כמה עשית?</b>\nשלח לי את הסכום בש\"ח")
 
-            # תוצאה — הפסד
+            # תוצאה — הפסד (כפתור ישן/סגירה ידנית לפני פגיעה)
             elif cbd.startswith("rl_"):
                 trade_id = cbd[3:]
-                trade = next((t for t in data["trades"] if t["id"] == trade_id and t["status"] == "open"), None)
+                trade = next((t for t in data["trades"] if t["id"] == trade_id), None)
                 if not trade:
                     send_telegram("⚠️ לא נמצאה עסקה")
+                    continue
+                if trade["status"] == "closed":
+                    trade["ack"] = True
+                    save_data(data)
+                    send_telegram(f"👍 עסקה {fmt_tn(trade.get('number','?'))} כבר נסגרה אוטומטית ({trade.get('pnl')} ש\"ח) — נרשם")
                     continue
                 risk_distance = abs(trade["entry"] - trade["stop"])
                 loss = round(points_to_ils(risk_distance) + SPREAD_COST_ILS, 2)
@@ -1311,6 +1460,45 @@ def handle_callbacks(data, last_update_id):
                     send_telegram(run_backtest())
                 except Exception as e:
                     send_telegram(f"⚠️ הבדיקה נכשלה: {e}")
+                continue
+
+            # 3.4: פקודת /status — הבוט חי? מה המצב?
+            if text.lower() in ("/status", "status", "סטטוס"):
+                try:
+                    now = now_il()
+                    open_real = [t for t in data["trades"] if t["status"] == "open"]
+                    open_shadow = [s for s in data.get("shadow_trades", []) if s.get("status") == "open"]
+                    unacked = [t for t in data["trades"] if t["status"] == "closed" and t.get("ack") is False]
+                    breaker = consecutive_loss_block(data)
+                    today = get_today_key()
+                    daily = data["daily_stats"].get(today, {})
+                    last_scan = _runtime.get("last_scan")
+                    scan_txt = last_scan.strftime("%H:%M:%S") if last_scan else "עוד לא נסרק"
+                    trend_txt = "?"
+                    try:
+                        tr = get_trend_filter(SYMBOLS["זהב"])
+                        if tr:
+                            state = {"long": "עלייה 🟢", "short": "ירידה 🔴", "none": "דדזון ⚪"}.get(tr["allowed"], "?")
+                            trend_txt = f"{state} ({tr['deviation_pct']:+.2f}% מ-EMA50)"
+                    except Exception:
+                        pass
+                    in_hours = 8 <= now.hour < 22
+                    evening = now.hour >= LAST_ENTRY_HOUR
+                    send_telegram(
+                        f"🩺 <b>סטטוס — גרסה 3.4</b>\n"
+                        f"✅ חי | 🕐 {now.strftime('%H:%M:%S')}\n"
+                        f"🔎 סריקה אחרונה: {scan_txt}\n"
+                        f"📈 מגמה: {trend_txt}\n"
+                        f"🕗 שעות מסחר: {'כן' if in_hours else 'לא'}"
+                        + (f" | 🌆 אחרי {LAST_ENTRY_HOUR}:00 — אין איתותים חדשים" if evening and in_hours else "") + "\n"
+                        f"🛑 ברייקר: {'פעיל — עצירה עד מחר' if breaker else 'לא פעיל'}\n"
+                        f"📂 סלוטים: {len(open_real)}/{MAX_PARALLEL_TRADES} תפוסים"
+                        + (f" | 👁️ סימולציה פתוחה: {len(open_shadow)}" if open_shadow else "") + "\n"
+                        + (f"🔔 ממתין לאישור שלך: {len(unacked)}\n" if unacked else "")
+                        + f"📊 היום: {daily.get('signals_sent', 0)} איתותים | {daily.get('entered', 0)} כניסות | {round(daily.get('pnl', 0), 2)} ש\"ח"
+                    )
+                except Exception as e:
+                    send_telegram(f"🩺 חי, אבל שגיאה בהרכבת הסטטוס: {e}")
                 continue
 
             waiting_trade = next((t for t in data["trades"] if t.get("waiting_early_exit") and t["status"] == "open"), None)
@@ -1345,20 +1533,39 @@ def handle_callbacks(data, last_update_id):
 # ============================================================
 # מעקב עסקאות פתוחות + זיהוי אוטומטי (high/low)
 # ============================================================
+def _finalize_trade(data, trade, result, pnl, close_dt=None):
+    """3.4: סגירה רשמית ברגע הזיהוי — close_time לפי השוק, לא לפי האישור."""
+    trade["status"] = "closed"
+    trade["result"] = result
+    trade["pnl"] = round(pnl, 2)
+    trade["close_time"] = (close_dt or now_il()).isoformat()
+    trade["ack"] = False
+    trade["last_alert"] = now_il().isoformat()
+    trade["alert_repeats"] = 0
+    stats = data["all_time_stats"]
+    if result == "win":
+        stats["wins"] += 1
+    elif result == "loss":
+        stats["losses"] += 1
+    else:  # timeout — נספר לפי סימן ה-pnl אך לא כרווח/הפסד מלא בסטטיסטיקת win rate
+        stats.setdefault("timeouts", 0)
+        stats["timeouts"] += 1
+    stats["total_trades"] += 1
+    stats["total_pnl"] = round(stats.get("total_pnl", 0) + trade["pnl"], 2)
+    day = trade["close_time"][:10]
+    if day not in data["daily_stats"]:
+        data["daily_stats"][day] = {}
+    data["daily_stats"][day]["pnl"] = round(data["daily_stats"][day].get("pnl", 0) + trade["pnl"], 2)
+
 def monitor_open_trades(data):
     now = now_il()
     candle_cache = {}
     changed = False
 
-    for trade in data["trades"]:
-        if trade["status"] != "open":
-            continue
-
-        symbol_name = trade["symbol"]
+    def get_candle(symbol_name):
         symbol_code = SYMBOLS.get(symbol_name)
         if not symbol_code:
-            continue
-
+            return None
         if symbol_code not in candle_cache:
             pd = get_prices(symbol_code, outputsize=5)
             if pd and pd["closes"]:
@@ -1367,64 +1574,127 @@ def monitor_open_trades(data):
                     "low": pd["lows"][-1],
                     "close": pd["closes"][-1]
                 }
-        candle = candle_cache.get(symbol_code)
+        return candle_cache.get(symbol_code)
+
+    for trade in data["trades"]:
+        if trade["status"] == "open":
+            candle = get_candle(trade["symbol"])
+            if not candle:
+                continue
+
+            high, low, current = candle["high"], candle["low"], candle["close"]
+            direction = trade["direction"]
+            stop = trade["stop"]
+            target1 = trade["target1"]
+            num = trade.get("number", "?")
+
+            target_hit = (high >= target1) if direction == "קנייה" else (low <= target1)
+            stop_hit = (low <= stop) if direction == "קנייה" else (high >= stop)
+
+            # עדיפות לסטופ (שמרני) במקרה ששניהם נגעו באותו נר
+            if stop_hit:
+                risk_distance = abs(trade["entry"] - stop)
+                loss = points_to_ils(risk_distance) + SPREAD_COST_ILS
+                _finalize_trade(data, trade, "loss", -loss)
+                changed = True
+                keyboard = [[{"text": "👍 קיבלתי", "callback_data": f"ok_{trade['id']}"}]]
+                send_telegram(
+                    f"🛑 <b>עסקה {fmt_tn(num)} — נגעת בסטופ. נסגרה אוטומטית.</b>\n"
+                    f"{trade['symbol']} | מחיר: {current} | סטופ: {stop}\n"
+                    f"💸 {trade['pnl']} ש\"ח\n"
+                    f"(3.4: הסגירה נרשמה ברגע הזיהוי — אשר קבלה 👇)",
+                    keyboard
+                )
+                update_indicator_weights(data)
+                print(f"[AUTO] 🛑 סטופ עסקה {fmt_tn(num)} — נסגרה בזיהוי", flush=True)
+
+            elif target_hit:
+                reward_distance = abs(target1 - trade["entry"])
+                profit = points_to_ils(reward_distance) - SPREAD_COST_ILS
+                _finalize_trade(data, trade, "win", profit)
+                changed = True
+                keyboard = [[{"text": "👍 קיבלתי", "callback_data": f"ok_{trade['id']}"}]]
+                send_telegram(
+                    f"🎯 <b>עסקה {fmt_tn(num)} — טארגט 1! נסגרה אוטומטית.</b>\n"
+                    f"{trade['symbol']} | מחיר: {current} | טארגט: {target1}\n"
+                    f"💰 +{trade['pnl']} ש\"ח\n"
+                    f"(אם אתה עדיין בפוזיציה בפלוס500 — סגור שם. אשר קבלה 👇)",
+                    keyboard
+                )
+                update_indicator_weights(data)
+                print(f"[AUTO] 🎯 טארגט עסקה {fmt_tn(num)} — נסגרה בזיהוי", flush=True)
+
+            else:
+                # timeout 6 שעות: סגירה אוטומטית במחיר השוק (כמו במנוע ה-backtest)
+                try:
+                    expired = now >= datetime.datetime.fromisoformat(trade["timeout"])
+                except (TypeError, ValueError):
+                    expired = True
+                if expired:
+                    diff = (current - trade["entry"]) if direction == "קנייה" else (trade["entry"] - current)
+                    pnl = points_to_ils(diff) - SPREAD_COST_ILS if diff > 0 else -(points_to_ils(abs(diff)) + SPREAD_COST_ILS)
+                    _finalize_trade(data, trade, "timeout", pnl)
+                    changed = True
+                    keyboard = [[{"text": "👍 קיבלתי", "callback_data": f"ok_{trade['id']}"}]]
+                    send_telegram(
+                        f"⏰ <b>עסקה {fmt_tn(num)} — {TRADE_TIMEOUT_HOURS} שעות. נסגרה אוטומטית במחיר שוק.</b>\n"
+                        f"מחיר: {current} | כניסה: {trade['entry']}\n"
+                        f"💰 {trade['pnl']} ש\"ח\n"
+                        f"(אם אתה עדיין בפוזיציה — סגור בפלוס500. אשר קבלה 👇)",
+                        keyboard
+                    )
+                    print(f"[AUTO] ⏰ timeout עסקה {fmt_tn(num)} — נסגרה במחיר שוק", flush=True)
+
+        # תזכורת חוזרת: עסקה סגורה שלא אושרה תוך 30 דק' — עד 5 תזכורות
+        elif trade["status"] == "closed" and trade.get("ack") is False:
+            try:
+                last = datetime.datetime.fromisoformat(trade.get("last_alert", trade["close_time"]))
+                overdue = (now - last).total_seconds() >= REMINDER_MINUTES * 60
+            except (TypeError, ValueError):
+                overdue = True
+            if overdue and trade.get("alert_repeats", 0) < MAX_REMINDERS:
+                trade["alert_repeats"] = trade.get("alert_repeats", 0) + 1
+                trade["last_alert"] = now.isoformat()
+                changed = True
+                keyboard = [[{"text": "👍 קיבלתי", "callback_data": f"ok_{trade['id']}"}]]
+                res_txt = {"win": "רווח 🎯", "loss": "הפסד 🛑", "timeout": "סגירת זמן ⏰"}.get(trade.get("result"), "")
+                send_telegram(
+                    f"🔔 <b>תזכורת {trade['alert_repeats']}/{MAX_REMINDERS} — עסקה {fmt_tn(trade.get('number','?'))} נסגרה ({res_txt})</b>\n"
+                    f"💰 {trade.get('pnl')} ש\"ח — אשר קבלה 👇",
+                    keyboard
+                )
+
+    # ================= 3.4: מעקב סימולציה (שקט — בלי טלגרם) =================
+    for sh in data.get("shadow_trades", []):
+        if sh.get("status") != "open":
+            continue
+        candle = get_candle(sh["symbol"])
         if not candle:
             continue
-
-        high = candle["high"]
-        low = candle["low"]
-        current = candle["close"]
-        direction = trade["direction"]
-        stop = trade["stop"]
-        target1 = trade["target1"]
-        num = trade.get("number", "?")
-
-        target_hit = (high >= target1) if direction == "קנייה" else (low <= target1)
-        stop_hit = (low <= stop) if direction == "קנייה" else (high >= stop)
-
-        # עדיפות לסטופ (שמרני) במקרה ששניהם נגעו באותו נר
-        if stop_hit and not trade.get("stop_alerted"):
-            trade["stop_alerted"] = True
+        high, low, current = candle["high"], candle["low"], candle["close"]
+        is_long = sh["direction"] == "קנייה"
+        stop_hit = (low <= sh["stop"]) if is_long else (high >= sh["stop"])
+        target_hit = (high >= sh["target1"]) if is_long else (low <= sh["target1"])
+        result = None
+        if stop_hit:
+            result, pnl = "loss", -(points_to_ils(abs(sh["entry"] - sh["stop"])) + SPREAD_COST_ILS)
+        elif target_hit:
+            result, pnl = "win", points_to_ils(abs(sh["target1"] - sh["entry"])) - SPREAD_COST_ILS
+        else:
+            try:
+                if now >= datetime.datetime.fromisoformat(sh["timeout"]):
+                    diff = (current - sh["entry"]) if is_long else (sh["entry"] - current)
+                    result = "timeout"
+                    pnl = points_to_ils(diff) - SPREAD_COST_ILS if diff > 0 else -(points_to_ils(abs(diff)) + SPREAD_COST_ILS)
+            except (TypeError, ValueError):
+                pass
+        if result:
+            sh["status"] = "closed"
+            sh["result"] = result
+            sh["pnl"] = round(pnl, 2)
+            sh["close_time"] = now.isoformat()
             changed = True
-            keyboard = [[{"text": "🛑 סגור בהפסד", "callback_data": f"rl_{trade['id']}"}]]
-            send_telegram(
-                f"🛑 <b>עסקה {fmt_tn(num)} — נגעת בסטופ!</b>\n"
-                f"{symbol_name} | מחיר: {current}\n"
-                f"סטופ: {stop}\n"
-                f"אשר סגירה בהפסד 👇",
-                keyboard
-            )
-            print(f"[AUTO] 🛑 סטופ עסקה {fmt_tn(num)}", flush=True)
-
-        elif target_hit and not trade.get("target_alerted"):
-            trade["target_alerted"] = True
-            changed = True
-            keyboard = [[{"text": "✅ סגור ברווח", "callback_data": f"rf_{trade['id']}"}]]
-            send_telegram(
-                f"🎯 <b>עסקה {fmt_tn(num)} — נגעת בטארגט 1!</b>\n"
-                f"{symbol_name} | מחיר: {current}\n"
-                f"טארגט: {target1}\n"
-                f"אשר סגירה ברווח 👇",
-                keyboard
-            )
-            print(f"[AUTO] 🎯 טארגט עסקה {fmt_tn(num)}", flush=True)
-
-        # תזכורת timeout
-        timeout = datetime.datetime.fromisoformat(trade["timeout"])
-        try:
-            expired = now >= timeout
-        except TypeError:
-            expired = True  # ערבוב aware/naive מנתונים ישנים — שלח תזכורת ליתר ביטחון
-        if expired and not trade.get("timeout_sent"):
-            trade["timeout_sent"] = True
-            changed = True
-            keyboard = [[{"text": "🔒 סגרתי עסקה", "callback_data": f"cl_{trade['id']}"}]]
-            send_telegram(
-                f"⏰ <b>תזכורת — עסקה {fmt_tn(num)}</b>\n"
-                f"פתוחה {TRADE_TIMEOUT_HOURS} שעות!\n"
-                f"מחיר: {current} | כניסה: {trade['entry']}",
-                keyboard
-            )
+            print(f"[SHADOW] {sh['number']} נסגרה: {result} {sh['pnl']}", flush=True)
 
     if changed:
         save_data(data)
@@ -1459,11 +1729,38 @@ def send_daily_report(data):
     win_rate = round(stats["wins"] / stats["total_trades"] * 100) if stats["total_trades"] > 0 else 0
     total_pnl = round(stats.get("total_pnl", 0), 2)
     storage_note = "" if _storage_source == "gist" else "\n⚠️ אחסון זמני בלבד — הנתונים לא ב-Gist!"
+
+    # 3.4: מסלול הסימולציה — כל מה שהמערכת ראתה היום
+    shadows_today = [s for s in data.get("shadow_trades", [])
+                     if s.get("status") == "closed" and s.get("close_time", "").startswith(today)]
+    sh_wins = sum(1 for s in shadows_today if s["result"] == "win")
+    sh_losses = sum(1 for s in shadows_today if s["result"] == "loss")
+    sh_touts = sum(1 for s in shadows_today if s["result"] == "timeout")
+    sh_pnl = round(sum(s.get("pnl", 0) for s in shadows_today), 2)
+    sh_open = sum(1 for s in data.get("shadow_trades", []) if s.get("status") == "open")
+    blocked = daily.get("blocked", {})
+    blocked_txt = ""
+    if blocked:
+        blocked_txt = "🚫 נחסמו תפעולית: " + " | ".join(f"{k}: {v}" for k, v in blocked.items()) + "\n"
+    skipped = daily.get("skipped", 0)
+
+    shadow_section = (
+        f"\n👁️ <b>עיני המערכת (סימולציה, בלי מגבלות):</b>\n"
+        f"נסגרו היום: {len(shadows_today)} | ✅ {sh_wins} | ❌ {sh_losses}"
+        + (f" | ⏰ {sh_touts}" if sh_touts else "")
+        + (f" | פתוחות: {sh_open}" if sh_open else "") + "\n"
+        f"💰 {sh_pnl} ש\"ח\n"
+        f"{blocked_txt}"
+        + (f"👋 דילגת על: {skipped}\n" if skipped else "")
+    ) if (shadows_today or sh_open or blocked or skipped) else ""
+
     send_telegram(
         f"📊 <b>דוח יומי — {today}</b>\n\n"
+        f"💼 <b>התיק שלך:</b>\n"
         f"🔔 איתותים שנשלחו: {signals_today}\n"
         f"✅ עסקאות שנכנסת: {entered_today}\n"
-        f"💰 רווח/הפסד היום: {round(pnl_today, 2)} ש\"ח\n\n"
+        f"💰 רווח/הפסד היום: {round(pnl_today, 2)} ש\"ח\n"
+        f"{shadow_section}\n"
         f"📈 סה\"כ עסקאות: {stats['total_trades']}\n"
         f"✅ רווחים: {stats['wins']} | ❌ הפסדים: {stats['losses']}\n"
         f"📊 אחוז הצלחה: {win_rate}%\n"
@@ -1475,7 +1772,7 @@ def send_daily_report(data):
 # לולאה ראשית
 # ============================================================
 def main():
-    print("🤖 בוט מסחר מופעל! [גרסה 3.3 — חסימת RSI קיצוני + חיתוך ערב 19:00]", flush=True)
+    print("🤖 בוט מסחר מופעל! [גרסה 3.4 — סימולציה כפולה + סגירה בזיהוי + /status]", flush=True)
     print(f"TOKEN exists: {bool(TELEGRAM_TOKEN)}", flush=True)
     print(f"CHAT_ID: {CHAT_ID}", flush=True)
     print(f"GIST configured: {gist_enabled()}", flush=True)
@@ -1493,13 +1790,14 @@ def main():
         storage_line = "⚠️ אחסון זמני בלבד (/tmp) — הגדר GIST_ID + GIST_TOKEN ב-Render"
 
     send_telegram(
-        "🤖 <b>בוט המסחר הופעל!</b> (גרסה 3.3)\n\n"
+        "🤖 <b>בוט המסחר הופעל!</b> (גרסה 3.4)\n\n"
         "📊 סורק: זהב (XAU/USD)\n"
         "⏰ כל 10 דקות | 🕐 08:00—22:00 (ישראל)\n\n"
         "🧭 <b>מסחר עם המגמה בלבד</b>\n"
         "פילטר EMA50 (1h) קובע כיוון — נגד המגמה נחסם\n"
         "🛑 עצירה אוטומטית אחרי 3 הפסדים ברצף\n"
-        "💡 שלח /backtest לבדיקת הלוגיקה על 30 ימים אחורה\n"
+        "💡 /backtest — בדיקת עבר | /status — מצב הבוט\n"
+        "👁️ סימולציה מקבילה: המערכת עוקבת גם אחרי איתותים חסומים\n"
         f"{storage_line}"
     )
 
@@ -1523,6 +1821,7 @@ def main():
             if time.time() - last_scan_time >= SCAN_INTERVAL:
                 last_scan_time = time.time()
                 scan_count += 1
+                _runtime["last_scan"] = now
                 print(f"\n--- סריקה #{scan_count} {now.strftime('%H:%M:%S')} ---", flush=True)
 
                 for name, code in SYMBOLS.items():
