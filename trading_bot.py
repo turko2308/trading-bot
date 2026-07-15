@@ -1221,6 +1221,112 @@ def run_backtest():
 # ============================================================
 # טיפול בתגובות משתמש
 # ============================================================
+
+# ============================================================
+# 3.4.1: ניתוח MFE/MAE — פקודת /mfe בטלגרם
+# עונה על שתי שאלות: "טארגט רחוק מדי?" מול "כניסה מאוחרת?"
+# לכל עסקה סגורה מה-Gist: כמה המחיר הלך לטובתנו (MFE) ונגדנו (MAE)
+# לפני הסגירה, באחוזים מהדרך לטארגט1/לסטופ.
+# קריאה וחישוב בלבד — לא נוגע בנתונים ולא בלוגיקת המסחר.
+# ============================================================
+def _trade_excursions(trade, m15):
+    """מחזיר (mfe_pct, mae_pct, n_candles) לעסקה סגורה, או None אם אין נרות בטווח."""
+    try:
+        et = datetime.datetime.fromisoformat(trade["entry_time"]).replace(tzinfo=None)
+        ct = datetime.datetime.fromisoformat(trade["close_time"]).replace(tzinfo=None)
+    except Exception:
+        return None
+    # כולל את נר הכניסה (נפתח עד 15 דק' לפני הכניסה). הטיה אפשרית: תנועה
+    # בתוך הנר לפני הכניסה נספרת — מגזים מעט את ה-MFE. הטיה שמרנית:
+    # אם גם ככה ה-MFE יוצא אפסי, מסקנת "כניסה מאוחרת" רק מתחזקת.
+    lo_bound = et - datetime.timedelta(minutes=15)
+    window = [c for c in m15 if lo_bound <= c["t"] <= ct]
+    if not window:
+        return None
+    entry = trade["entry"]; target = trade["target1"]; stop = trade["stop"]
+    hi = max(c["h"] for c in window)
+    lo = min(c["l"] for c in window)
+    if trade["direction"] == "קנייה":
+        mfe = (hi - entry) / (target - entry) * 100 if target != entry else 0.0
+        mae = (entry - lo) / (entry - stop) * 100 if entry != stop else 0.0
+    else:
+        mfe = (entry - lo) / (entry - target) * 100 if entry != target else 0.0
+        mae = (hi - entry) / (stop - entry) * 100 if stop != entry else 0.0
+    return (max(0.0, mfe), max(0.0, mae), len(window))
+
+def run_mfe_analysis(data):
+    """מחזיר רשימת הודעות טלגרם: התפלגות MFE של כל העסקאות הסגורות + פירוט."""
+    m15 = _fetch_history(SYMBOLS["זהב"], "15min", 4000)
+    if not m15:
+        return ["⚠️ משיכת נרות נכשלה — נסה שוב מאוחר יותר"]
+    closed = [t for t in data.get("trades", []) if t.get("status") == "closed"
+              and t.get("entry_time") and t.get("close_time")]
+    if not closed:
+        return ["אין עסקאות סגורות לניתוח"]
+    closed.sort(key=lambda t: t["entry_time"])
+    buckets = [("0-10% — לא ביקרה ברווח", 0, 10),
+               ("10-33% — ביקור קצר", 10, 33),
+               ("33-66% — הלכה חצי דרך", 33, 66),
+               ("66-99% — כמעט טארגט", 66, 99),
+               ("100%+ — הגיעה לטארגט", 99, 10**9)]
+    counts = {b[0]: 0 for b in buckets}
+    lines = []
+    analyzed = 0
+    no_data = 0
+    losses_mfe = []
+    for t in closed:
+        ex = _trade_excursions(t, m15)
+        if ex is None:
+            no_data += 1
+            continue
+        mfe, mae, _n = ex
+        analyzed += 1
+        res = t.get("result", "?")
+        icon = {"win": "✅", "loss": "❌", "timeout": "⏰"}.get(res, "▫️")
+        if res in ("loss", "timeout"):
+            losses_mfe.append(mfe)
+        for name, b_lo, b_hi in buckets:
+            if b_lo <= mfe < b_hi:
+                counts[name] += 1
+                break
+        try:
+            dur_h = (datetime.datetime.fromisoformat(t["close_time"])
+                     - datetime.datetime.fromisoformat(t["entry_time"])).total_seconds() / 3600
+        except Exception:
+            dur_h = 0.0
+        lines.append(f"{icon} {fmt_tn(t.get('number','?'))} | רווח מקס' {mfe:.0f}% | נגד {mae:.0f}% | {dur_h:.1f}ש'")
+    if analyzed == 0:
+        return ["⚠️ אין נרות תואמים לעסקאות (ייתכן שהעסקאות ישנות מ-40 יום)"]
+    msg1 = ["📐 <b>ניתוח MFE — כמה כל עסקה ביקרה ברווח לפני הסגירה</b>",
+            f"נותחו {analyzed} עסקאות סגורות" + (f" | אין נרות ל-{no_data}" if no_data else ""),
+            "אחוזים = כמה מהדרך לטארגט1 המחיר עבר לטובתנו", ""]
+    msg1.append("<b>התפלגות (כל העסקאות):</b>")
+    for name, _b1, _b2 in buckets:
+        msg1.append(f"• {name}: {counts[name]}")
+    if losses_mfe:
+        s = sorted(losses_mfe)
+        n = len(s)
+        med = s[n // 2] if n % 2 == 1 else (s[n // 2 - 1] + s[n // 2]) / 2.0
+        under10 = sum(1 for v in s if v < 10)
+        over50 = sum(1 for v in s if v >= 50)
+        msg1 += ["", "<b>הפסדים ו-timeouts בלבד:</b>",
+                 f"• חציון ביקור ברווח: {med:.0f}%",
+                 f"• לא ביקרו ברווח כלל (<10%): {under10} מתוך {n}",
+                 f"• עברו חצי דרך לטארגט (50%+): {over50} מתוך {n}",
+                 "",
+                 "🔎 קריאה: רוב מתחת ל-10% = כניסה מאוחרת (מחמירים כניסות);",
+                 "רוב מעל 50% = טארגט רחוק (בודקים טארגט קצר/Break-even בשלב ד')"]
+    msgs = ["\n".join(msg1)]
+    detail = "📋 <b>פירוט לפי עסקה</b>\n" + "\n".join(lines)
+    while len(detail) > 3800:
+        cut = detail.rfind("\n", 0, 3800)
+        if cut <= 0:
+            break
+        msgs.append(detail[:cut])
+        detail = detail[cut + 1:]
+    msgs.append(detail)
+    return msgs
+
 def _retro_check(data, trade, signal_dt, now):
     """3.4: בלחיצת 'נכנסתי' מאוחרת — בודק אם הסטופ/טארגט כבר נפגעו מאז האיתות.
     אם כן: סוגר מיד עם התוצאה הנכונה ו-close_time של נר הפגיעה. מחזיר True אם נסגרה."""
@@ -1460,6 +1566,16 @@ def handle_callbacks(data, last_update_id):
                     send_telegram(run_backtest())
                 except Exception as e:
                     send_telegram(f"⚠️ הבדיקה נכשלה: {e}")
+                continue
+
+            # 3.4.1: ניתוח MFE — "טארגט רחוק מדי?" מול "כניסה מאוחרת?"
+            if text.lower() in ("/mfe", "mfe", "ניתוח"):
+                send_telegram("⏳ מנתח את כל העסקאות הסגורות מול נרות היסטוריים...")
+                try:
+                    for _part in run_mfe_analysis(data):
+                        send_telegram(_part)
+                except Exception as e:
+                    send_telegram(f"⚠️ הניתוח נכשל: {e}")
                 continue
 
             # 3.4: פקודת /status — הבוט חי? מה המצב?
@@ -1772,7 +1888,7 @@ def send_daily_report(data):
 # לולאה ראשית
 # ============================================================
 def main():
-    print("🤖 בוט מסחר מופעל! [גרסה 3.4 — סימולציה כפולה + סגירה בזיהוי + /status]", flush=True)
+    print("🤖 בוט מסחר מופעל! [גרסה 3.4.1 — נוספה פקודת /mfe (ניתוח קריאה בלבד)]", flush=True)
     print(f"TOKEN exists: {bool(TELEGRAM_TOKEN)}", flush=True)
     print(f"CHAT_ID: {CHAT_ID}", flush=True)
     print(f"GIST configured: {gist_enabled()}", flush=True)
@@ -1790,13 +1906,13 @@ def main():
         storage_line = "⚠️ אחסון זמני בלבד (/tmp) — הגדר GIST_ID + GIST_TOKEN ב-Render"
 
     send_telegram(
-        "🤖 <b>בוט המסחר הופעל!</b> (גרסה 3.4)\n\n"
+        "🤖 <b>בוט המסחר הופעל!</b> (גרסה 3.4.1)\n\n"
         "📊 סורק: זהב (XAU/USD)\n"
         "⏰ כל 10 דקות | 🕐 08:00—22:00 (ישראל)\n\n"
         "🧭 <b>מסחר עם המגמה בלבד</b>\n"
         "פילטר EMA50 (1h) קובע כיוון — נגד המגמה נחסם\n"
         "🛑 עצירה אוטומטית אחרי 3 הפסדים ברצף\n"
-        "💡 /backtest — בדיקת עבר | /status — מצב הבוט\n"
+        "💡 /backtest — בדיקת עבר | /status — מצב | /mfe — ניתוח עסקאות\n"
         "👁️ סימולציה מקבילה: המערכת עוקבת גם אחרי איתותים חסומים\n"
         f"{storage_line}"
     )
