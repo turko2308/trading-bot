@@ -949,7 +949,8 @@ def _fetch_history(symbol, interval, outputsize):
 def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None,
               deadzone=None, rsi_extreme_block=False,
               limit_entry_pct=None, last_entry_hour=None,
-              target_mult=2.0, breakeven_frac=None, slippage_points=0.0):
+              target_mult=2.0, breakeven_frac=None, slippage_points=0.0,
+              min_daily_range=None):
     """
     מדמה את הלוגיקה החיה על נתוני העבר.
     stop_floor_pct: רצפת סטופ באחוזים (למשל 0.35).
@@ -964,6 +965,10 @@ def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None,
     slippage_points: מבחן עמידות — כל כניסת שוק מוזזת X נקודות לרעת הכיוון
                      (לונג נכנס גבוה יותר, שורט נמוך יותר). הסטופ/טארגט נגזרים
                      מהכניסה המוזזת — מדמה את פער הדגימה חי-מול-מנוע שנצפה ב-/cross.
+    min_daily_range: שער תנועה — אין כניסות חדשות ביום שבו ממוצע הטווח
+                     (high-low) של שני ימי המסחר הקודמים נמוך מסף זה בנקודות.
+                     ההיגיון: הימים הרווחיים היו ימי תנועה; הטבחים — דשדוש.
+                     משתמש בימים קודמים בלבד — אין הצצה לעתיד.
     """
     LIMIT_EXPIRY_CANDLES = 4  # לימיט חי שעה (4 נרות 15 דק')
     if deadzone is None:
@@ -976,6 +981,20 @@ def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None,
     highs = [c["h"] for c in m15]
     lows = [c["l"] for c in m15]
     times = [c["t"] for c in m15]
+
+    # שער תנועה: טווח (high-low) לכל יום בנתונים — לשימוש כ"ימים קודמים" בלבד
+    day_ranges = {}
+    if min_daily_range is not None:
+        for c in m15:
+            dk = c["t"].strftime("%Y-%m-%d")
+            if dk not in day_ranges:
+                day_ranges[dk] = [c["h"], c["l"]]
+            else:
+                day_ranges[dk][0] = max(day_ranges[dk][0], c["h"])
+                day_ranges[dk][1] = min(day_ranges[dk][1], c["l"])
+        day_ranges = {k: v[0] - v[1] for k, v in day_ranges.items()}
+    range_day_keys = sorted(day_ranges.keys())
+    gated_days = set()
 
     open_trades = []
     pending_limits = []  # וריאנט 5: הזמנות לימיט שממתינות למילוי
@@ -1059,6 +1078,13 @@ def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None,
         # --- תנאי כניסה (זהים לחיים) ---
         if not (8 <= t.hour < 22):
             continue
+        if min_daily_range is not None:
+            prev_days = [k for k in range_day_keys if k < day][-2:]
+            if len(prev_days) == 2:
+                avg_range = (day_ranges[prev_days[0]] + day_ranges[prev_days[1]]) / 2.0
+                if avg_range < min_daily_range:
+                    gated_days.add(day)
+                    continue  # שער תנועה: היומיים הקודמים רדומים — לא סוחרים היום
         if last_entry_hour is not None and t.hour >= last_entry_hour:
             continue  # וריאנט 6: אין כניסות חדשות בערב
         if daily_signals.get(day, 0) >= MAX_ENTERED_PER_DAY:
@@ -1172,7 +1198,7 @@ def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None,
         "trades": len(closed), "wins": len(wins), "losses": len(losses),
         "timeouts": len(touts), "win_rate": win_rate, "pnl": total_pnl,
         "unfilled": expired_limits, "be": len(bes),
-        "detail": closed
+        "detail": closed, "gated_days": len(gated_days)
     }
 
 def run_backtest():
@@ -1225,6 +1251,25 @@ def run_backtest():
         parts.append(block(name, r, base_pnl))
         if base_pnl is None:
             base_pnl = r["pnl"]
+    # 3.4.4: שער תנועה — אין כניסות ביום שאחרי יומיים רדומים.
+    # ספי המשתמש (5-20) + שניים גבוהים לראות איפה השער מתחיל לנשוך.
+    parts.append("🚪 <b>שער תנועה</b> (בסיס + אין מסחר אחרי יומיים רדומים):")
+    gate_results = []
+    for thr in (5.0, 10.0, 15.0, 20.0, 30.0, 40.0):
+        kw = dict(live); kw["min_daily_range"] = thr
+        rg = _simulate(m15, h1, **kw)
+        gate_results.append((thr, rg))
+        parts.append(f"  סף {thr:.0f} נק': {rg['trades']} עסק' | {rg['win_rate']} | "
+                     f"{rg['pnl']:+.0f} ש\"ח ({rg['pnl'] - base_pnl:+.0f}) | 🚪 {rg['gated_days']} ימים בחוץ")
+    best_thr, best_r = max(gate_results, key=lambda x: x[1]["pnl"])
+    if best_r["pnl"] > base_pnl:
+        parts.append(f"  🧪 עמידות לסף הטוב ({best_thr:.0f} נק'):")
+        for slip in (3.0, 6.0, 10.0):
+            kw = dict(live); kw["min_daily_range"] = best_thr; kw["slippage_points"] = slip
+            rs2 = _simulate(m15, h1, **kw)
+            parts.append(f"    ‏{slip:.0f} נק' נגד: {rs2['win_rate']} | {rs2['pnl']:+.0f} ש\"ח")
+    parts.append("")
+
     # 3.4.3: מבחן עמידות — הבסיס עם כניסות מוזזות לרעתנו.
     # רקע: /cross הראה שפער דגימה של ~10 נק' ב-13/07 הפך +165 ל-134-.
     # אם הרווח קורס על הזזה קטנה — אין יתרון אמיתי, יש רעש ביצוע.
@@ -1985,7 +2030,7 @@ def send_daily_report(data):
 # לולאה ראשית
 # ============================================================
 def main():
-    print("🤖 בוט מסחר מופעל! [גרסה 3.4.3 — מבחן עמידות ב-/backtest]", flush=True)
+    print("🤖 בוט מסחר מופעל! [גרסה 3.4.4 — שער תנועה ב-/backtest]", flush=True)
     print(f"TOKEN exists: {bool(TELEGRAM_TOKEN)}", flush=True)
     print(f"CHAT_ID: {CHAT_ID}", flush=True)
     print(f"GIST configured: {gist_enabled()}", flush=True)
@@ -2003,7 +2048,7 @@ def main():
         storage_line = "⚠️ אחסון זמני בלבד (/tmp) — הגדר GIST_ID + GIST_TOKEN ב-Render"
 
     send_telegram(
-        "🤖 <b>בוט המסחר הופעל!</b> (גרסה 3.4.3)\n\n"
+        "🤖 <b>בוט המסחר הופעל!</b> (גרסה 3.4.4)\n\n"
         "📊 סורק: זהב (XAU/USD)\n"
         "⏰ כל 10 דקות | 🕐 08:00—22:00 (ישראל)\n\n"
         "🧭 <b>מסחר עם המגמה בלבד</b>\n"
