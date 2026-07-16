@@ -1007,7 +1007,8 @@ def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None,
                 if stop_same:
                     closed.append({"result": "loss",
                                    "pnl": -(points_to_ils(stop_distance) + SPREAD_COST_ILS),
-                                   "stars": p["stars"], "day": day})
+                                   "stars": p["stars"], "day": day,
+                                   "et": t, "ct": t, "dir": p["dir"], "entry": entry})
                 else:
                     open_trades.append({"dir": p["dir"], "entry": entry, "stop": stop,
                                         "target": target, "time": t, "stars": p["stars"]})
@@ -1024,19 +1025,23 @@ def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None,
                 if tr.get("be"):
                     # וריאנט 4: הסטופ כבר הוזז לכניסה — יציאה באפס פחות ספרד
                     closed.append({"result": "be", "pnl": -SPREAD_COST_ILS,
-                                   "stars": tr["stars"], "day": day})
+                                   "stars": tr["stars"], "day": day,
+                                   "et": tr["time"], "ct": t, "dir": tr["dir"], "entry": tr["entry"]})
                 else:
                     d_ = abs(tr["entry"] - tr["stop"])
                     closed.append({"result": "loss", "pnl": -(points_to_ils(d_) + SPREAD_COST_ILS),
-                                   "stars": tr["stars"], "day": day})
+                                   "stars": tr["stars"], "day": day,
+                                   "et": tr["time"], "ct": t, "dir": tr["dir"], "entry": tr["entry"]})
             elif target_hit:
                 d_ = abs(tr["target"] - tr["entry"])
                 closed.append({"result": "win", "pnl": points_to_ils(d_) - SPREAD_COST_ILS,
-                               "stars": tr["stars"], "day": day})
+                               "stars": tr["stars"], "day": day,
+                               "et": tr["time"], "ct": t, "dir": tr["dir"], "entry": tr["entry"]})
             elif timed_out:
                 diff = (closes[i] - tr["entry"]) if is_long else (tr["entry"] - closes[i])
                 pnl = points_to_ils(diff) - SPREAD_COST_ILS if diff > 0 else -(points_to_ils(abs(diff)) + SPREAD_COST_ILS)
-                closed.append({"result": "timeout", "pnl": pnl, "stars": tr["stars"], "day": day})
+                closed.append({"result": "timeout", "pnl": pnl, "stars": tr["stars"], "day": day,
+                               "et": tr["time"], "ct": t, "dir": tr["dir"], "entry": tr["entry"]})
             else:
                 # וריאנט 4: break-even — שמרני: הטריגר מהנר הנוכחי נכנס לתוקף מהנר הבא
                 if breakeven_frac is not None and not tr.get("be"):
@@ -1162,7 +1167,8 @@ def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None,
     return {
         "trades": len(closed), "wins": len(wins), "losses": len(losses),
         "timeouts": len(touts), "win_rate": win_rate, "pnl": total_pnl,
-        "unfilled": expired_limits, "be": len(bes)
+        "unfilled": expired_limits, "be": len(bes),
+        "detail": closed
     }
 
 def run_backtest():
@@ -1221,6 +1227,74 @@ def run_backtest():
 # ============================================================
 # טיפול בתגובות משתמש
 # ============================================================
+
+# ============================================================
+# 3.4.2: הצלבת מנוע מול מציאות — פקודת /cross בטלגרם
+# רקע: המנוע מראה +402 על חודש בעוד המציאות מדממת (623-, 21%).
+# ההצלבה מדפיסה יום-מול-יום: מה המנוע מדמה (זמן/כיוון/מחיר/תוצאה)
+# מול העסקאות האמיתיות מה-state. קריאה וחישוב בלבד.
+# ============================================================
+def run_cross_check(data):
+    """מחזיר רשימת הודעות: עסקאות המנוע מול העסקאות האמיתיות, 4 ימי מסחר אחרונים."""
+    symbol = list(SYMBOLS.values())[0]
+    m15 = _fetch_history(symbol, "15min", 2900)
+    h1 = _fetch_history(symbol, "1h", 800)
+    if not m15 or not h1 or len(m15) < 200 or len(h1) < 100:
+        return ["⚠️ לא הצלחתי למשוך מספיק נתונים היסטוריים. נסה שוב מאוחר יותר."]
+    live = dict(stop_floor_pct=STOP_FLOOR_PCT, max_stretch_pct=MAX_STRETCH_PCT,
+                rsi_extreme_block=True, last_entry_hour=LAST_ENTRY_HOUR)
+    r = _simulate(m15, h1, **live)
+    detail = r.get("detail", [])
+    days = sorted({c["t"].strftime("%Y-%m-%d") for c in m15})[-4:]
+    icon = {"win": "✅", "loss": "❌", "timeout": "⏰", "be": "🤝"}
+    arrow = {"long": "🟢קנייה", "short": "🔴מכירה"}
+    lines = ["🔬 <b>הצלבה: מנוע backtest מול המציאות</b>",
+             "לכל יום — מה המנוע מדמה מול מה שנרשם בבוט החי", ""]
+    for day in days:
+        sim_day = [c for c in detail if c.get("et") is not None
+                   and c["et"].strftime("%Y-%m-%d") == day]
+        sim_day.sort(key=lambda c: c["et"])
+        sim_pnl = round(sum(c["pnl"] for c in sim_day), 2)
+        d_disp = datetime.datetime.strptime(day, "%Y-%m-%d").strftime("%d/%m")
+        lines.append(f"═══ {d_disp} ═══")
+        lines.append(f"🤖 <b>המנוע</b> — {len(sim_day)} עסק' | {sim_pnl:+.0f} ש\"ח:")
+        if sim_day:
+            for c in sim_day:
+                lines.append(f"  {icon.get(c['result'],'▫️')} {c['et'].strftime('%H:%M')} "
+                             f"{arrow.get(c['dir'],'?')} @{c['entry']:.1f} ← {c['pnl']:+.0f}")
+        else:
+            lines.append("  (אין עסקאות)")
+        real_day = [t for t in data.get("trades", [])
+                    if str(t.get("entry_time", "")).startswith(day)]
+        real_day.sort(key=lambda t: t.get("entry_time", ""))
+        real_pnl = data.get("daily_stats", {}).get(day, {}).get("pnl")
+        pnl_txt = f"{real_pnl:+.0f} ש\"ח" if isinstance(real_pnl, (int, float)) else "—"
+        lines.append(f"👤 <b>הבוט החי</b> — {len(real_day)} עסק' | {pnl_txt}:")
+        if real_day:
+            for t in real_day:
+                try:
+                    hh = datetime.datetime.fromisoformat(t["entry_time"]).strftime("%H:%M")
+                except Exception:
+                    hh = "?"
+                dr = "🟢קנייה" if t.get("direction") == "קנייה" else "🔴מכירה"
+                pnl_v = t.get("pnl")
+                pnl_s = f"{pnl_v:+.0f}" if isinstance(pnl_v, (int, float)) else "פתוחה"
+                lines.append(f"  {icon.get(t.get('result'),'▫️')} {hh} {dr} @{t.get('entry',0):.1f} ← {pnl_s}")
+        else:
+            lines.append("  (אין עסקאות)")
+        lines.append("")
+    lines.append("🔎 קריאה: זמנים/כיוונים/מחירים שונים = המנוע רואה שוק אחר;")
+    lines.append("עסקאות דומות עם תוצאות שונות = הבעיה בסימולציית הסגירה")
+    text = "\n".join(lines)
+    msgs = []
+    while len(text) > 3800:
+        cut = text.rfind("\n", 0, 3800)
+        if cut <= 0:
+            break
+        msgs.append(text[:cut])
+        text = text[cut + 1:]
+    msgs.append(text)
+    return msgs
 
 # ============================================================
 # 3.4.1: ניתוח MFE/MAE — פקודת /mfe בטלגרם
@@ -1578,6 +1652,16 @@ def handle_callbacks(data, last_update_id):
                     send_telegram(f"⚠️ הניתוח נכשל: {e}")
                 continue
 
+            # 3.4.2: הצלבת מנוע מול מציאות
+            if text.lower() in ("/cross", "cross", "הצלבה"):
+                send_telegram("⏳ מריץ את המנוע ומצליב מול העסקאות האמיתיות...")
+                try:
+                    for _part in run_cross_check(data):
+                        send_telegram(_part)
+                except Exception as e:
+                    send_telegram(f"⚠️ ההצלבה נכשלה: {e}")
+                continue
+
             # 3.4: פקודת /status — הבוט חי? מה המצב?
             if text.lower() in ("/status", "status", "סטטוס"):
                 try:
@@ -1888,7 +1972,7 @@ def send_daily_report(data):
 # לולאה ראשית
 # ============================================================
 def main():
-    print("🤖 בוט מסחר מופעל! [גרסה 3.4.1 — נוספה פקודת /mfe (ניתוח קריאה בלבד)]", flush=True)
+    print("🤖 בוט מסחר מופעל! [גרסה 3.4.2 — נוספו /mfe ו-/cross (ניתוחי קריאה בלבד)]", flush=True)
     print(f"TOKEN exists: {bool(TELEGRAM_TOKEN)}", flush=True)
     print(f"CHAT_ID: {CHAT_ID}", flush=True)
     print(f"GIST configured: {gist_enabled()}", flush=True)
@@ -1906,13 +1990,13 @@ def main():
         storage_line = "⚠️ אחסון זמני בלבד (/tmp) — הגדר GIST_ID + GIST_TOKEN ב-Render"
 
     send_telegram(
-        "🤖 <b>בוט המסחר הופעל!</b> (גרסה 3.4.1)\n\n"
+        "🤖 <b>בוט המסחר הופעל!</b> (גרסה 3.4.2)\n\n"
         "📊 סורק: זהב (XAU/USD)\n"
         "⏰ כל 10 דקות | 🕐 08:00—22:00 (ישראל)\n\n"
         "🧭 <b>מסחר עם המגמה בלבד</b>\n"
         "פילטר EMA50 (1h) קובע כיוון — נגד המגמה נחסם\n"
         "🛑 עצירה אוטומטית אחרי 3 הפסדים ברצף\n"
-        "💡 /backtest — בדיקת עבר | /status — מצב | /mfe — ניתוח עסקאות\n"
+        "💡 /backtest | /status | /mfe | /cross — מנוע מול מציאות\n"
         "👁️ סימולציה מקבילה: המערכת עוקבת גם אחרי איתותים חסומים\n"
         f"{storage_line}"
     )
