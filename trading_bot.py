@@ -949,7 +949,7 @@ def _fetch_history(symbol, interval, outputsize):
 def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None,
               deadzone=None, rsi_extreme_block=False,
               limit_entry_pct=None, last_entry_hour=None,
-              target_mult=2.0, breakeven_frac=None):
+              target_mult=2.0, breakeven_frac=None, slippage_points=0.0):
     """
     מדמה את הלוגיקה החיה על נתוני העבר.
     stop_floor_pct: רצפת סטופ באחוזים (למשל 0.35).
@@ -961,6 +961,9 @@ def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None,
     last_entry_hour: אין כניסות חדשות משעה זו (למשל 19). המעקב על פתוחות נמשך. וריאנט 6.
     target_mult: טארגט כמכפלת מרחק הסטופ (ברירת מחדל 2.0 כמו בחי). חקר אחוז זכייה.
     breakeven_frac: אחרי שהמחיר עבר חלק זה מהדרך לטארגט (למשל 0.5) — הסטופ זז לכניסה. וריאנט 4.
+    slippage_points: מבחן עמידות — כל כניסת שוק מוזזת X נקודות לרעת הכיוון
+                     (לונג נכנס גבוה יותר, שורט נמוך יותר). הסטופ/טארגט נגזרים
+                     מהכניסה המוזזת — מדמה את פער הדגימה חי-מול-מנוע שנצפה ב-/cross.
     """
     LIMIT_EXPIRY_CANDLES = 4  # לימיט חי שעה (4 נרות 15 דק')
     if deadzone is None:
@@ -1150,9 +1153,10 @@ def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None,
                                    "stop_distance": stop_distance,
                                    "stars": stars, "signal_i": i})
         else:
-            stop = current - stop_distance if is_long else current + stop_distance
-            target = current + stop_distance * target_mult if is_long else current - stop_distance * target_mult
-            open_trades.append({"dir": direction, "entry": current, "stop": stop,
+            entry_px = current + slippage_points if is_long else current - slippage_points
+            stop = entry_px - stop_distance if is_long else entry_px + stop_distance
+            target = entry_px + stop_distance * target_mult if is_long else entry_px - stop_distance * target_mult
+            open_trades.append({"dir": direction, "entry": entry_px, "stop": stop,
                                 "target": target, "time": t, "stars": stars})
         daily_signals[day] = daily_signals.get(day, 0) + 1
         last_signal_time = t
@@ -1221,6 +1225,15 @@ def run_backtest():
         parts.append(block(name, r, base_pnl))
         if base_pnl is None:
             base_pnl = r["pnl"]
+    # 3.4.3: מבחן עמידות — הבסיס עם כניסות מוזזות לרעתנו.
+    # רקע: /cross הראה שפער דגימה של ~10 נק' ב-13/07 הפך +165 ל-134-.
+    # אם הרווח קורס על הזזה קטנה — אין יתרון אמיתי, יש רעש ביצוע.
+    parts.append("🧪 <b>מבחן עמידות</b> (הבסיס, כניסה מוזזת נגדנו):")
+    for slip in (3.0, 6.0, 10.0):
+        kw = dict(live); kw["slippage_points"] = slip
+        rs = _simulate(m15, h1, **kw)
+        parts.append(f"  ‏{slip:.0f} נק' נגד: {rs['win_rate']} | {rs['pnl']:+.0f} ש\"ח ({rs['pnl'] - base_pnl:+.0f} מול הבסיס)")
+    parts.append("")
     parts.append("💡 אחוז = זכיות מתוך זכיות+הפסדים | ⏰ = תום 6 שעות | 🤝 = סטופ שהוזז לכניסה")
     return "\n".join(parts)
 
@@ -1972,7 +1985,7 @@ def send_daily_report(data):
 # לולאה ראשית
 # ============================================================
 def main():
-    print("🤖 בוט מסחר מופעל! [גרסה 3.4.2 — נוספו /mfe ו-/cross (ניתוחי קריאה בלבד)]", flush=True)
+    print("🤖 בוט מסחר מופעל! [גרסה 3.4.3 — מבחן עמידות ב-/backtest]", flush=True)
     print(f"TOKEN exists: {bool(TELEGRAM_TOKEN)}", flush=True)
     print(f"CHAT_ID: {CHAT_ID}", flush=True)
     print(f"GIST configured: {gist_enabled()}", flush=True)
@@ -1990,7 +2003,7 @@ def main():
         storage_line = "⚠️ אחסון זמני בלבד (/tmp) — הגדר GIST_ID + GIST_TOKEN ב-Render"
 
     send_telegram(
-        "🤖 <b>בוט המסחר הופעל!</b> (גרסה 3.4.2)\n\n"
+        "🤖 <b>בוט המסחר הופעל!</b> (גרסה 3.4.3)\n\n"
         "📊 סורק: זהב (XAU/USD)\n"
         "⏰ כל 10 דקות | 🕐 08:00—22:00 (ישראל)\n\n"
         "🧭 <b>מסחר עם המגמה בלבד</b>\n"
