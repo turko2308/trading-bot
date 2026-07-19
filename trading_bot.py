@@ -882,12 +882,19 @@ def analyze_and_signal(symbol_name, symbol_code, data):
         f"⏰ יציאה: {timeout_time}"
     )
 
-    keyboard = [[
-        {"text": "✅ נכנסתי", "callback_data": f"en_{trade_id}"},
-        {"text": "❌ דילגתי", "callback_data": f"sk_{trade_id}"}
-    ]]
-
-    send_telegram(msg, keyboard)
+    if OLD_SIGNALS_WATCH_ONLY:
+        # 3.5.0: הישנה נפסלה למסחר (מבחן עמידות 16/07) — נשארת כעיניים בלבד.
+        # אין כפתורים ואין pending: אין דרך "להיכנס" עליה בטעות.
+        pending.pop(trade_id, None)
+        msg = msg.replace("🚨 <b>איתות סחר", "🚨 <b>[מעקב בלבד] איתות ישן")
+        msg += "\n📊 <i>המערכת הישנה — לא למסחר. הסימולציה עוקבת.</i>"
+        send_telegram(msg)
+    else:
+        keyboard = [[
+            {"text": "✅ נכנסתי", "callback_data": f"en_{trade_id}"},
+            {"text": "❌ דילגתי", "callback_data": f"sk_{trade_id}"}
+        ]]
+        send_telegram(msg, keyboard)
 
     data["signal_history"].append({
         "symbol": symbol_name,
@@ -1295,6 +1302,12 @@ def run_backtest():
 # סימולציה וקריאה בלבד — הלוגיקה החיה לא נגעה.
 # ============================================================
 SLOW_RISK_ILS = 40.0            # סיכון התחלתי לעסקה בש"ח (סקאלת הבוט)
+# ===== 3.5.0: מצב כפול — שיטה 2 למסחר, הישנה למעקב-בלבד =====
+SLOW_LIVE = True                # True = איתותי שיטה 2 (🐢) פעילים עם כפתורים
+OLD_SIGNALS_WATCH_ONLY = True   # True = איתותי השיטה הישנה (🚨) נשלחים בלי כפתורים, "מעקב בלבד"; הצללים ממשיכים
+SLOW_ENTRY_DAYS = 20            # כניסה: פריצת שיא/שפל 20 ימי מסחר (הקומבינציה שניצחה ב-/slow: +474, 46%, שרדה 10 נק')
+SLOW_TRAIL_DAYS = 3             # יציאה: סטופ נגרר של 3 ימי מסחר
+SLOW_PENDING_HOURS = 4          # תוקף איתות עד הנר הבא
 CANDLES_PER_DAY_4H = 6          # זהב נסחר ~24 שעות → 6 נרות 4ש' ליום מסחר
 
 def _spread_points():
@@ -1389,6 +1402,149 @@ def _simulate_slow(h4, entry_days=10, trail_days=5, risk_ils=SLOW_RISK_ILS,
         "avg_days": round(sum(x["days"] for x in closed) / n, 1) if n else 0.0,
         "detail": closed,
     }
+
+def slow_scan_and_monitor(data):
+    """3.5.0: הלב החי של שיטה 2 — רץ בכל סריקה (10 דק').
+
+    על נר 4 שעות סגור חדש: עדכון סטופ נגרר לעסקה פתוחה, או בדיקת פריצה
+    לאיתות חדש (רק כשאין עסקה/איתות ממתין — עסקה אחת בכל רגע).
+    בכל סריקה: בדיקה אם המחיר חצה את הסטופ הנגרר → סגירה אוטומטית בזיהוי (כמו 3.4).
+    """
+    symbol_name = list(SYMBOLS.keys())[0]
+    symbol = SYMBOLS[symbol_name]
+    now = now_il().replace(tzinfo=None)
+    ew = SLOW_ENTRY_DAYS * CANDLES_PER_DAY_4H
+    tw = SLOW_TRAIL_DAYS * CANDLES_PER_DAY_4H
+    h4 = _fetch_history(symbol, "4h", ew + 40)
+    if not h4 or len(h4) < ew + 2:
+        print("[SLOW] אין מספיק נרות 4h", flush=True)
+        return
+    closed_candles = [c for c in h4 if c["t"] + datetime.timedelta(hours=4) <= now]
+    if len(closed_candles) < ew + 1:
+        return
+    last_closed = closed_candles[-1]
+    current_price = h4[-1]["c"]  # הנר האחרון (גם אם בבנייה) = המחיר העדכני
+    state = data.setdefault("slow_state", {})
+    spread_pts = _spread_points()
+
+    open_trade = next((t for t in data.get("trades", [])
+                       if t.get("system") == 2 and t.get("status") == "open"), None)
+
+    # --- ניטור עסקה פתוחה: חציית סטופ נגרר → סגירה אוטומטית ---
+    if open_trade:
+        trail = open_trade["stop"]
+        is_long = open_trade["direction"] == "קנייה"
+        crossed = (is_long and current_price <= trail) or ((not is_long) and current_price >= trail)
+        if crossed:
+            exit_px = trail
+            pts = (exit_px - open_trade["entry"]) if is_long else (open_trade["entry"] - exit_px)
+            pnl = (pts - spread_pts) * open_trade.get("ils_per_pt", points_to_ils(1))
+            result = "win" if pnl > 0 else "loss"
+            _finalize_trade(data, open_trade, result, pnl)
+            save_data(data)
+            icon = "✅" if result == "win" else "🛑"
+            keyboard = [[{"text": "👍 קיבלתי", "callback_data": f"ok_{open_trade['id']}"}]]
+            send_telegram(
+                f"{icon} <b>עסקה {fmt_tn(open_trade['number'])} — הסטופ הנגרר נחצה. נסגרה אוטומטית.</b>\n"
+                f"{symbol_name} | מחיר: {round(current_price, 2)} | יציאה: {round(exit_px, 2)}\n"
+                f"💰 {pnl:+.2f} ש\"ח | החזקה: "
+                f"{max(0, (now - datetime.datetime.fromisoformat(open_trade['entry_time']).replace(tzinfo=None)).days)} ימים\n"
+                f"(סגור גם בפלוס500 עכשיו — אשר קבלה 👇)",
+                keyboard
+            )
+            print(f"[SLOW] עסקה {open_trade['number']} נסגרה: {result} {pnl:+.1f}", flush=True)
+            open_trade = None
+
+    # --- דברים שקורים רק על נר סגור חדש ---
+    last_key = last_closed["t"].isoformat()
+    if state.get("last_candle") == last_key:
+        return
+    state["last_candle"] = last_key
+
+    if open_trade:
+        # עדכון סטופ נגרר — מתהדק בלבד
+        window = closed_candles[-tw:]
+        is_long = open_trade["direction"] == "קנייה"
+        new_trail = min(x["l"] for x in window) if is_long else max(x["h"] for x in window)
+        old_trail = open_trade["stop"]
+        tightened = (is_long and new_trail > old_trail) or ((not is_long) and new_trail < old_trail)
+        if tightened and abs(new_trail - old_trail) >= 1.0:
+            open_trade["stop"] = round(new_trail, 2)
+            save_data(data)
+            locked = (new_trail - open_trade["entry"]) if is_long else (open_trade["entry"] - new_trail)
+            send_telegram(
+                f"🔃 <b>סטופ נגרר עודכן — עסקה {fmt_tn(open_trade['number'])}</b>\n"
+                f"סטופ חדש: <b>{open_trade['stop']}</b> (היה {round(old_trail, 2)})\n"
+                f"מחיר נוכחי: {round(current_price, 2)} | "
+                + (f"🔒 נעול רווח: {points_to_ils(locked) and ''}{locked:+.1f} נק'" if locked > 0 else f"מרחק מהכניסה: {locked:+.1f} נק'") + "\n"
+                f"(עדכן את הסטופ גם בפלוס500)"
+            )
+            print(f"[SLOW] trail {old_trail} → {open_trade['stop']}", flush=True)
+        save_data(data)
+        return
+
+    # --- אין עסקה: בדיקת איתות פריצה על הנר הסגור החדש ---
+    slow_pending = {k: v for k, v in data.get("pending", {}).items() if v.get("system") == 2}
+    # ניקוי איתותים איטיים שפג תוקפם
+    cutoff = (now - datetime.timedelta(hours=SLOW_PENDING_HOURS)).isoformat()
+    for k, v in list(slow_pending.items()):
+        if v.get("time", "") < cutoff:
+            data["pending"].pop(k, None)
+            slow_pending.pop(k, None)
+    if slow_pending:
+        return  # יש איתות ממתין — לא שולחים חדש
+
+    prior = closed_candles[-(ew + 1):-1]
+    hh = max(x["h"] for x in prior)
+    ll = min(x["l"] for x in prior)
+    direction = None
+    if last_closed["c"] > hh:
+        direction = "קנייה"
+    elif last_closed["c"] < ll:
+        direction = "מכירה"
+    if not direction:
+        return
+
+    is_long = direction == "קנייה"
+    entry_px = round(last_closed["c"], 2)
+    t_win = closed_candles[-tw:]
+    trail0 = round(min(x["l"] for x in t_win) if is_long else max(x["h"] for x in t_win), 2)
+    stop_pts = abs(entry_px - trail0)
+    if stop_pts < 1e-6:
+        return
+    ils_per_pt = SLOW_RISK_ILS / stop_pts
+    oz = ils_per_pt / USD_ILS
+
+    data["slow_seq"] = data.get("slow_seq", 0) + 1
+    num = f"איטי #{data['slow_seq']}"
+    trade_id = make_trade_id("SLOW", now.strftime("%d%H%M"))
+    data.setdefault("pending", {})[trade_id] = {
+        "number": num, "symbol": symbol_name, "direction": direction,
+        "entry": entry_px, "stop": trail0, "target1": None, "target2": None,
+        "stars": None, "system": 2, "ils_per_pt": round(ils_per_pt, 4),
+        "time": now.isoformat()
+    }
+    keyboard = [[
+        {"text": "✅ נכנסתי", "callback_data": f"en_{trade_id}"},
+        {"text": "❌ דילגתי", "callback_data": f"sk_{trade_id}"}
+    ]]
+    send_telegram(
+        f"🐢 <b>איתות שיטה 2 — {num} — {symbol_name}</b>\n"
+        f"🕐 {now.strftime('%d/%m %H:%M')} | נר 4 שעות נסגר "
+        f"{'מעל שיא' if is_long else 'מתחת שפל'} {SLOW_ENTRY_DAYS} ימים\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"📊 כיוון: <b>{direction} {'🟢' if is_long else '🔴'}</b>\n"
+        f"💰 כניסה: סביב <b>{entry_px}</b>\n"
+        f"🛑 סטופ נגרר התחלתי: <b>{trail0}</b> ({stop_pts:.1f} נק')\n"
+        f"🎯 טארגט: אין — יוצאים רק כשהסטופ הנגרר נחצה\n"
+        f"📏 גודל פוזיציה לסיכון {SLOW_RISK_ILS:.0f} ש\"ח: <b>{oz:.2f} אונקיות</b>\n"
+        f"⏳ החזקה צפויה: ימים עד שבועות | תוקף האיתות: {SLOW_PENDING_HOURS} שעות\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"(בפלוס500 שלך הסכומים כפולים — התאם את הגודל)",
+        keyboard
+    )
+    save_data(data)
+    print(f"[SLOW] ✅ איתות {num}: {direction} @{entry_px} trail {trail0}", flush=True)
 
 def run_slow_report():
     """דוח שיטה 2: 9 קומבינציות + עמידות לטובה + וריאנט טארגט 5 נק' להשוואה."""
@@ -1685,6 +1841,34 @@ def handle_callbacks(data, last_update_id):
                     signal_dt = now
                 timeout = (signal_dt + datetime.timedelta(hours=TRADE_TIMEOUT_HOURS)).isoformat()
                 num = signal.get("number", "?")
+                # 3.5.0: כניסה לעסקת שיטה 2 — מבנה שונה: בלי טארגט/timeout, עם סטופ נגרר
+                if signal.get("system") == 2:
+                    trade = {
+                        "id": trade_id, "number": num, "symbol": signal["symbol"],
+                        "direction": signal["direction"], "entry": signal["entry"],
+                        "stop": signal["stop"], "target1": None, "target2": None,
+                        "system": 2, "ils_per_pt": signal.get("ils_per_pt", 1.0),
+                        "stars": None, "entry_time": signal_dt.isoformat(),
+                        "confirmed_time": now.isoformat(), "status": "open",
+                    }
+                    data["trades"].append(trade)
+                    pending.pop(trade_id, None)
+                    today = get_today_key()
+                    if today not in data["daily_stats"]:
+                        data["daily_stats"][today] = {}
+                    data["daily_stats"][today]["entered"] = data["daily_stats"][today].get("entered", 0) + 1
+                    save_data(data)
+                    keyboard = [[{"text": "🔒 סגרתי עסקה", "callback_data": f"cl_{trade_id}"}]]
+                    send_telegram(
+                        f"🐢 <b>עסקה {fmt_tn(num)} נפתחה — {signal['symbol']} (שיטה 2)</b>\n"
+                        f"כיוון: {'קנייה 🟢' if signal['direction'] == 'קנייה' else 'מכירה 🔴'}\n"
+                        f"כניסה: {signal['entry']} | סטופ נגרר: {signal['stop']}\n"
+                        f"🎯 בלי טארגט — הבוט יזיז את הסטופ ויודיע. החזקה: ימים.\n"
+                        f"אין צורך לשבת מול המסך — כל שינוי יגיע בהתראה.",
+                        keyboard
+                    )
+                    print(f"[CALLBACK] 🐢 עסקת שיטה 2 {fmt_tn(num)} נפתחה", flush=True)
+                    continue
                 trade = {
                     "id": trade_id,
                     "number": num,
@@ -1994,6 +2178,8 @@ def monitor_open_trades(data):
         return candle_cache.get(symbol_code)
 
     for trade in data["trades"]:
+        if trade.get("system") == 2:
+            continue  # 3.5.0: עסקאות שיטה 2 מנוהלות ב-slow_scan_and_monitor (סטופ נגרר, בלי timeout)
         if trade["status"] == "open":
             candle = get_candle(trade["symbol"])
             if not candle:
@@ -2189,7 +2375,7 @@ def send_daily_report(data):
 # לולאה ראשית
 # ============================================================
 def main():
-    print("🤖 בוט מסחר מופעל! [גרסה 3.4.5 — /slow: שיטה 2 (עוקב מגמה איטי)]", flush=True)
+    print("🤖 בוט מסחר מופעל! [גרסה 3.5.0 — שיטה 2 חיה 🐢 + הישנה במעקב בלבד]", flush=True)
     print(f"TOKEN exists: {bool(TELEGRAM_TOKEN)}", flush=True)
     print(f"CHAT_ID: {CHAT_ID}", flush=True)
     print(f"GIST configured: {gist_enabled()}", flush=True)
@@ -2207,14 +2393,13 @@ def main():
         storage_line = "⚠️ אחסון זמני בלבד (/tmp) — הגדר GIST_ID + GIST_TOKEN ב-Render"
 
     send_telegram(
-        "🤖 <b>בוט המסחר הופעל!</b> (גרסה 3.4.5)\n\n"
-        "📊 סורק: זהב (XAU/USD)\n"
-        "⏰ כל 10 דקות | 🕐 08:00—22:00 (ישראל)\n\n"
-        "🧭 <b>מסחר עם המגמה בלבד</b>\n"
-        "פילטר EMA50 (1h) קובע כיוון — נגד המגמה נחסם\n"
-        "🛑 עצירה אוטומטית אחרי 3 הפסדים ברצף\n"
-        "💡 /backtest | /status | /mfe | /cross | /slow — שיטה 2\n"
-        "👁️ סימולציה מקבילה: המערכת עוקבת גם אחרי איתותים חסומים\n"
+        "🤖 <b>בוט המסחר הופעל!</b> (גרסה 3.5.0)\n\n"
+        "🐢 <b>שיטה 2 — למסחר:</b> פריצת 20 ימים על נר 4 שעות,\n"
+        "סטופ נגרר, בלי טארגט. איתות עם כפתורים = אמיתי.\n"
+        "צפי: 1-2 איתותים בשבוע. שקט = תקין.\n\n"
+        "🚨 <b>המערכת הישנה — מעקב בלבד:</b> בלי כפתורים,\n"
+        "לא למסחר. הסימולציה ממשיכה לרשום אותה.\n\n"
+        "💡 /backtest | /status | /mfe | /cross | /slow\n"
         f"{storage_line}"
     )
 
@@ -2249,6 +2434,13 @@ def main():
                         print(f"שגיאה ב{name}: {e}", flush=True)
 
                 monitor_open_trades(data)
+
+                # 3.5.0: שיטה 2 — סריקה וניטור (איתותי 🐢 + סטופ נגרר)
+                if SLOW_LIVE:
+                    try:
+                        slow_scan_and_monitor(data)
+                    except Exception as e:
+                        print(f"[SLOW] שגיאה: {e}", flush=True)
 
                 # ניסיון חוזר לדחיפה ל-Gist אם שמירה קודמת נכשלה
                 if _gist_dirty and gist_enabled():
