@@ -375,6 +375,36 @@ def get_prices(symbol, interval="15min", outputsize=50):
         print(f"שגיאה בשליפת נתונים {symbol}: {e}", flush=True)
         return None
 
+# 3.5.1: פתיחת היום — לתיעוד move_from_open ברשומות איתות (השערה 1).
+# נר יומי אחד, ממוטמן ליום שלם → עלות: קריאת API אחת ביום.
+_day_open_cache = {}
+
+def get_day_open(symbol_code):
+    """פתיחת הנר היומי הנוכחי. None בכשל — תיעוד בלבד, לא חוסם כלום."""
+    today = get_today_key()
+    cached = _day_open_cache.get(symbol_code)
+    if cached and cached["date"] == today:
+        return cached["value"]
+    try:
+        url = "https://api.twelvedata.com/time_series"
+        params = {
+            "symbol": symbol_code,
+            "interval": "1day",
+            "outputsize": 1,
+            "apikey": TWELVEDATA_KEY,
+            "timezone": "Asia/Jerusalem"
+        }
+        r = requests.get(url, params=params, timeout=15)
+        d = r.json()
+        if "values" not in d or not d["values"]:
+            return None
+        value = float(d["values"][0]["open"])
+        _day_open_cache[symbol_code] = {"date": today, "value": value}
+        return value
+    except Exception as e:
+        print(f"[DAY_OPEN] exception: {e}", flush=True)
+        return None
+
 def get_trend_filter(symbol_code):
     """
     פילטר מגמה קשה: EMA50 על נרות שעה.
@@ -682,12 +712,21 @@ def analyze_and_signal(symbol_name, symbol_code, data):
     score = 0.0
 
     # --- MACD: מומנטום בכיוון המגמה ---
+    # 3.5.1 (תיקון תיוג): "תומך" = הקו מעל/מתחת לקו האיתות (מומנטום משתפר).
+    # כשסימן הקו עצמו מנוגד לכיוון (שלילי בקנייה / חיובי במכירה) — מציינים
+    # זאת בתווית ומתעדים ב-macd_sign_agree. הניקוד לא השתנה — הפיכת הסכמת
+    # הסימן לדרישה קשה היא השערה שדורשת backtest, לא תיקון באג.
+    macd_sign_agree = None
     if macd_line is not None and macd_signal is not None:
         if is_long and macd_line > macd_signal:
-            signals.append(f"📈 MACD תומך ({macd_line})")
+            macd_sign_agree = macd_line > 0
+            note = "" if macd_sign_agree else "; הקו עוד שלילי"
+            signals.append(f"📈 MACD תומך ({macd_line}{note})")
             score += 1 * weights["macd"]
         elif (not is_long) and macd_line < macd_signal:
-            signals.append(f"📉 MACD תומך ({macd_line})")
+            macd_sign_agree = macd_line < 0
+            note = "" if macd_sign_agree else "; הקו עוד חיובי"
+            signals.append(f"📉 MACD תומך ({macd_line}{note})")
             score += 1 * weights["macd"]
 
     # --- פריצה בכיוון המגמה ---
@@ -776,6 +815,23 @@ def analyze_and_signal(symbol_name, symbol_code, data):
 
     now = now_il()
 
+    # 3.5.1: הקשר אנליטי לתיעוד (הבאג מהרשימה: adx / ema_dev / move_from_open).
+    # תיעוד בלבד — שום שער חדש. day_open=None בכשל, לא עוצר כלום.
+    day_open = get_day_open(symbol_code)
+    move_from_open = round(current - day_open, 2) if day_open else None
+    move_atr = round(move_from_open / atr, 2) if (move_from_open is not None and atr) else None
+    signal_context = {
+        "adx": adx,
+        "rsi": rsi,
+        "atr": atr,
+        "ema_dev": trend["deviation_pct"],
+        "day_open": day_open,
+        "move_from_open": move_from_open,   # חיובי = מעל הפתיחה
+        "move_atr": move_atr,               # המרחק ביחידות ATR (השערה 1)
+        "macd": macd_line,
+        "macd_sign_agree": macd_sign_agree
+    }
+
     # ================= 3.4: מסלול הסימולציה ("עיני המערכת") =================
     # כל איתות שעבר את שערי האיכות נרשם כאן — גם אם התפעול יחסום אותו בהמשך.
     # cooldown נפרד של 30 דק' לסימולציה, כדי לא לרשום את אותו מצב שוק 4 פעמים.
@@ -805,7 +861,8 @@ def analyze_and_signal(symbol_name, symbol_code, data):
             "time": now.isoformat(),
             "timeout": (now + datetime.timedelta(hours=TRADE_TIMEOUT_HOURS)).isoformat(),
             "status": "open",
-            "blocked_reason": None   # ימולא אם התפעול חוסם
+            "blocked_reason": None,  # ימולא אם התפעול חוסם
+            **signal_context         # 3.5.1: adx / ema_dev / move_from_open ועוד
         }
         shadow_list.append(shadow)
         data["shadow_last_signal"][symbol_name] = now.isoformat()
@@ -854,7 +911,8 @@ def analyze_and_signal(symbol_name, symbol_code, data):
         "target1": target1,
         "target2": target2,
         "stars": stars,
-        "time": now.isoformat()
+        "time": now.isoformat(),
+        **signal_context   # 3.5.1: הקשר אנליטי — עובר לעסקה האמיתית בכניסה
     }
     cutoff = (now - datetime.timedelta(hours=1)).isoformat()
     data["pending"] = {k: v for k, v in pending.items() if v["time"] > cutoff}
@@ -943,6 +1001,7 @@ def _fetch_history(symbol, interval, outputsize):
             fmt = "%Y-%m-%d %H:%M:%S" if len(ts) > 10 else "%Y-%m-%d"
             out.append({
                 "t": datetime.datetime.strptime(ts, fmt),
+                "o": float(v["open"]),
                 "h": float(v["high"]),
                 "l": float(v["low"]),
                 "c": float(v["close"])
@@ -957,7 +1016,7 @@ def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None,
               deadzone=None, rsi_extreme_block=False,
               limit_entry_pct=None, last_entry_hour=None,
               target_mult=2.0, breakeven_frac=None, slippage_points=0.0,
-              min_daily_range=None):
+              min_daily_range=None, max_move_from_open_atr=None):
     """
     מדמה את הלוגיקה החיה על נתוני העבר.
     stop_floor_pct: רצפת סטופ באחוזים (למשל 0.35).
@@ -976,6 +1035,12 @@ def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None,
                      (high-low) של שני ימי המסחר הקודמים נמוך מסף זה בנקודות.
                      ההיגיון: הימים הרווחיים היו ימי תנועה; הטבחים — דשדוש.
                      משתמש בימים קודמים בלבד — אין הצצה לעתיד.
+    max_move_from_open_atr: השערה 1 — חסימת רדיפה. אם המחיר כבר זז מפתיחת
+                     היום *בכיוון העסקה* יותר מ-K כפול ATR — אין כניסה
+                     (רדיפת מהלך שכבר קרה: 21/07 לונגים אחרי +70$,
+                     24/07 שורטים אחרי ירידה). מהלך נגד הכיוון לא חוסם —
+                     זו דווקא כניסת תיקון. פתיחת יום = פתיחת הנר הראשון
+                     של היום הקלנדרי בנתונים — ידועה בזמן האיתות, אין הצצה.
     """
     LIMIT_EXPIRY_CANDLES = 4  # לימיט חי שעה (4 נרות 15 דק')
     if deadzone is None:
@@ -1002,6 +1067,15 @@ def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None,
         day_ranges = {k: v[0] - v[1] for k, v in day_ranges.items()}
     range_day_keys = sorted(day_ranges.keys())
     gated_days = set()
+
+    # השערה 1: פתיחת כל יום קלנדרי = פתיחת הנר הראשון שלו בנתונים
+    day_opens = {}
+    if max_move_from_open_atr is not None:
+        for c in m15:
+            dk = c["t"].strftime("%Y-%m-%d")
+            if dk not in day_opens:
+                day_opens[dk] = c.get("o", c["c"])
+    blocked_chase = 0
 
     open_trades = []
     pending_limits = []  # וריאנט 5: הזמנות לימיט שממתינות למילוי
@@ -1145,6 +1219,16 @@ def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None,
         atr = calc_atr(w_h, w_l, w_c)
         brk = check_breakout(w_c, w_h, w_l)
 
+        # השערה 1: חסימת רדיפה — המחיר כבר זז מפתיחת היום בכיוון העסקה
+        # יותר מ-K כפול ATR → המהלך כבר קרה, לא רודפים אחריו.
+        if max_move_from_open_atr is not None and atr:
+            d_open = day_opens.get(day)
+            if d_open is not None:
+                move_dir = (current - d_open) if is_long else (d_open - current)
+                if move_dir > max_move_from_open_atr * atr:
+                    blocked_chase += 1
+                    continue
+
         score = 0.0
         supporting = 0
         if macd_line is not None and macd_sig is not None:
@@ -1205,7 +1289,8 @@ def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None,
         "trades": len(closed), "wins": len(wins), "losses": len(losses),
         "timeouts": len(touts), "win_rate": win_rate, "pnl": total_pnl,
         "unfilled": expired_limits, "be": len(bes),
-        "detail": closed, "gated_days": len(gated_days)
+        "detail": closed, "gated_days": len(gated_days),
+        "blocked_chase": blocked_chase
     }
 
 def run_backtest():
@@ -1288,6 +1373,60 @@ def run_backtest():
     parts.append("")
     parts.append("💡 אחוז = זכיות מתוך זכיות+הפסדים | ⏰ = תום 6 שעות | 🤝 = סטופ שהוזז לכניסה")
     return "\n".join(parts)
+
+def run_h1_backtest():
+    """השערה 1 (פקודת /h1): חסימת רדיפה — מרחק מפתיחת יום ב-ATR.
+    בודקת את ההשערה לבד מול הבסיס החי, על גריד ספים, + מבחן עמידות לסף
+    הטוב ביותר. מחזירה רשימת הודעות (מפוצל — מגבלת 4096 של טלגרם)."""
+    symbol = list(SYMBOLS.values())[0]
+    m15 = _fetch_history(symbol, "15min", 2900)   # ~30 ימי מסחר
+    h1 = _fetch_history(symbol, "1h", 800)
+    if not m15 or not h1 or len(m15) < 200 or len(h1) < 100:
+        return ["⚠️ לא הצלחתי למשוך מספיק נתונים היסטוריים. נסה שוב מאוחר יותר."]
+
+    date_from = m15[0]["t"].strftime("%d/%m")
+    date_to = m15[-1]["t"].strftime("%d/%m")
+    live = dict(stop_floor_pct=STOP_FLOOR_PCT, max_stretch_pct=MAX_STRETCH_PCT,
+                rsi_extreme_block=True, last_entry_hour=LAST_ENTRY_HOUR)
+
+    base = _simulate(m15, h1, **live)
+    parts = [f"🧪 <b>השערה 1: חסימת רדיפה — {date_from} עד {date_to}</b>\n"
+             f"אין כניסה אם המחיר כבר זז מפתיחת היום בכיוון העסקה יותר מ-K×ATR.\n\n"
+             f"<b>⚙️ בסיס (הלוגיקה החיה):</b>\n"
+             f"🔔 {base['trades']} עסק' | ✅ {base['wins']} | ❌ {base['losses']}"
+             + (f" | ⏰ {base['timeouts']}" if base['timeouts'] else "") + "\n"
+             f"📊 {base['win_rate']} | 💰 {base['pnl']:+.2f} ש\"ח\n"]
+
+    grid_results = []
+    lines = ["<b>🚪 גריד ספים (K × ATR):</b>"]
+    for k in (3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0):
+        kw = dict(live); kw["max_move_from_open_atr"] = k
+        r = _simulate(m15, h1, **kw)
+        grid_results.append((k, r))
+        lines.append(f"  K={k:.0f}: {r['trades']} עסק' | {r['win_rate']} | "
+                     f"{r['pnl']:+.0f} ש\"ח ({r['pnl'] - base['pnl']:+.0f}) | 🚫 נחסמו: {r['blocked_chase']}")
+    parts.append("\n".join(lines))
+
+    best_k, best_r = max(grid_results, key=lambda x: x[1]["pnl"])
+    verdict = []
+    if best_r["pnl"] > base["pnl"]:
+        verdict.append(f"\n🧪 <b>מבחן עמידות לסף הטוב (K={best_k:.0f}):</b>")
+        robust = True
+        for slip in (3.0, 6.0, 10.0):
+            kw = dict(live); kw["max_move_from_open_atr"] = best_k
+            kw["slippage_points"] = slip
+            rs = _simulate(m15, h1, **kw)
+            verdict.append(f"  ‏{slip:.0f} נק' נגד: {rs['win_rate']} | {rs['pnl']:+.0f} ש\"ח "
+                           f"({rs['pnl'] - base['pnl']:+.0f} מול בסיס ללא הזזה)")
+            if rs["pnl"] <= base["pnl"]:
+                robust = False
+        verdict.append("\n✅ שורד עמידות — מועמד ליישום." if robust
+                       else "\n⚠️ קורס תחת הזזה — יתרון לא אמיתי.")
+    else:
+        verdict.append("\n❌ אף סף לא שיפר את הבסיס בתקופה זו — ההשערה לא מאושרת על המדגם.")
+    verdict.append("💡 מספר עסקאות נמוך = מדגם קטן; לשקול גם מול חתכי ה-shadow החיים.")
+    parts.append("\n".join(verdict))
+    return parts
 
 # ============================================================
 # טיפול בתגובות משתמש
@@ -1887,6 +2026,11 @@ def handle_callbacks(data, last_update_id):
                     "stop_alerted": False,
                     "timeout_sent": False
                 }
+                # 3.5.1: הקשר אנליטי מהאיתות עובר לרשומת העסקה (אם קיים)
+                for _k in ("adx", "rsi", "atr", "ema_dev", "day_open",
+                           "move_from_open", "move_atr", "macd", "macd_sign_agree"):
+                    if _k in signal:
+                        trade[_k] = signal[_k]
                 data["trades"].append(trade)
                 pending.pop(trade_id, None)
                 today = get_today_key()
@@ -2029,6 +2173,16 @@ def handle_callbacks(data, last_update_id):
                 send_telegram("⏳ מריץ בדיקת עבר על ~30 ימים... (עד דקה)")
                 try:
                     send_telegram(run_backtest())
+                except Exception as e:
+                    send_telegram(f"⚠️ הבדיקה נכשלה: {e}")
+                continue
+
+            # 3.5.1: השערה 1 — חסימת רדיפה (מרחק מפתיחת יום ב-ATR)
+            if text.lower() in ("/h1", "h1", "השערה1", "השערה 1"):
+                send_telegram("⏳ בודק את השערה 1 (חסימת רדיפה) על ~30 ימים...")
+                try:
+                    for _part in run_h1_backtest():
+                        send_telegram(_part)
                 except Exception as e:
                     send_telegram(f"⚠️ הבדיקה נכשלה: {e}")
                 continue
@@ -2375,7 +2529,7 @@ def send_daily_report(data):
 # לולאה ראשית
 # ============================================================
 def main():
-    print("🤖 בוט מסחר מופעל! [גרסה 3.5.0 — שיטה 2 חיה 🐢 + הישנה במעקב בלבד]", flush=True)
+    print("🤖 בוט מסחר מופעל! [גרסה 3.5.1 — שיטה 2 חיה 🐢 + הישנה במעקב בלבד + /h1]", flush=True)
     print(f"TOKEN exists: {bool(TELEGRAM_TOKEN)}", flush=True)
     print(f"CHAT_ID: {CHAT_ID}", flush=True)
     print(f"GIST configured: {gist_enabled()}", flush=True)
@@ -2393,13 +2547,13 @@ def main():
         storage_line = "⚠️ אחסון זמני בלבד (/tmp) — הגדר GIST_ID + GIST_TOKEN ב-Render"
 
     send_telegram(
-        "🤖 <b>בוט המסחר הופעל!</b> (גרסה 3.5.0)\n\n"
+        "🤖 <b>בוט המסחר הופעל!</b> (גרסה 3.5.1)\n\n"
         "🐢 <b>שיטה 2 — למסחר:</b> פריצת 20 ימים על נר 4 שעות,\n"
         "סטופ נגרר, בלי טארגט. איתות עם כפתורים = אמיתי.\n"
         "צפי: 1-2 איתותים בשבוע. שקט = תקין.\n\n"
         "🚨 <b>המערכת הישנה — מעקב בלבד:</b> בלי כפתורים,\n"
         "לא למסחר. הסימולציה ממשיכה לרשום אותה.\n\n"
-        "💡 /backtest | /status | /mfe | /cross | /slow\n"
+        "💡 /backtest | /h1 | /status | /mfe | /cross | /slow\n"
         f"{storage_line}"
     )
 
