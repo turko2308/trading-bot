@@ -41,8 +41,12 @@ SYMBOLS = {
 }
 
 # שעות מסחר (שעון ישראל): 08:00–22:00
+# 3.6.2: חלון הפעילות הורחב ל-06:00-22:00 לבקשת המשתמש.
+# הערה מהנתונים (Dukascopy, 2.5 שנים): חלון 6-22 יצא ‏1,392- מתחת
+# לחלון 8-22 על אותם נתונים. ההרחבה נועדה לכסות את שעות המסחר
+# הידני של הבוקר (06:00-07:00), לא כשיפור צפוי לתוצאה.
 TRADING_HOURS = {
-    "זהב": {"start": 8, "end": 22}
+    "זהב": {"start": 6, "end": 22}
 }
 # 3.3: אין איתותים חדשים משעה זו (ערב = כניסות מפסידות; backtest 11/07: ‏+203 מול הבסיס).
 # המוניטור על עסקאות פתוחות ממשיך כרגיל 24/7.
@@ -1024,7 +1028,9 @@ def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None,
               limit_entry_pct=None, last_entry_hour=None,
               target_mult=2.0, breakeven_frac=None, slippage_points=0.0,
               min_daily_range=None, max_move_from_open_atr=None,
-              adx_rising_bars=None, first_entry_hour=None, long_only=False):
+              adx_rising_bars=None, first_entry_hour=None, long_only=False,
+              active_start=8, active_end=22,
+              fixed_target_pts=None, fixed_stop_pts=None):
     """
     מדמה את הלוגיקה החיה על נתוני העבר.
     stop_floor_pct: רצפת סטופ באחוזים (למשל 0.35).
@@ -1089,6 +1095,7 @@ def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None,
                 day_opens[dk] = c.get("o", c["c"])
     blocked_chase = 0
     blocked_fading = 0  # השערה 2: נחסמו כי ה-ADX יורד
+    blocked_hours = 0    # /h9: נרות מחוץ לחלון הפעילות
     blocked_morning = 0  # /h3: איתותים שנחסמו כי לפני שעת הפתיחה
     blocked_short = 0    # /h3: שורטים שנחסמו במצב לונג-בלבד
 
@@ -1172,7 +1179,10 @@ def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None,
         open_trades = still_open
 
         # --- תנאי כניסה (זהים לחיים) ---
-        if not (8 <= t.hour < 22):
+        # /h9: חלון הפעילות. ברירת המחדל 8-22 = הבוט החי. active_start=0
+        # ו-active_end=24 פותחים 24 שעות (הזהב נסחר גם בלילה).
+        if not (active_start <= t.hour < active_end):
+            blocked_hours += 1
             continue
         if min_daily_range is not None:
             prev_days = [k for k in range_day_keys if k < day][-2:]
@@ -1308,8 +1318,11 @@ def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None,
                                    "stars": stars, "signal_i": i})
         else:
             entry_px = current + slippage_points if is_long else current - slippage_points
-            stop = entry_px - stop_distance if is_long else entry_px + stop_distance
-            target = entry_px + stop_distance * target_mult if is_long else entry_px - stop_distance * target_mult
+            # יעד/סטופ קבועים בדולרים (בדיקת "5$ מספיק לי")
+            sd = fixed_stop_pts if fixed_stop_pts is not None else stop_distance
+            td = fixed_target_pts if fixed_target_pts is not None else sd * target_mult
+            stop = entry_px - sd if is_long else entry_px + sd
+            target = entry_px + td if is_long else entry_px - td
             open_trades.append({"dir": direction, "entry": entry_px, "stop": stop,
                                 "target": target, "time": t, "stars": stars})
         daily_signals[day] = daily_signals.get(day, 0) + 1
@@ -1329,6 +1342,7 @@ def _simulate(m15, h1, stop_floor_pct=None, max_stretch_pct=None,
         "detail": closed, "gated_days": len(gated_days),
         "blocked_chase": blocked_chase,
         "blocked_fading": blocked_fading,
+        "blocked_hours": blocked_hours,
         "blocked_morning": blocked_morning,
         "blocked_short": blocked_short
     }
@@ -1641,21 +1655,44 @@ def _spread_points():
     return SPREAD_COST_ILS / per_pt if per_pt else 0.5
 
 def _simulate_slow(h4, entry_days=10, trail_days=5, risk_ils=SLOW_RISK_ILS,
-                   slippage_points=0.0, fixed_target_points=None):
+                   slippage_points=0.0, fixed_target_points=None,
+                   pyramid_units=1, pyramid_step_n=0.5):
     """עוקב מגמה איטי על נרות 4 שעות.
 
     entry_days: פריצת שיא/שפל של N ימי מסחר (N*6 נרות) פותחת עסקה.
     trail_days: סטופ נגרר = שפל/שיא M ימים; מתהדק בלבד, לא נסוג.
-    risk_ils: הסיכון ההתחלתי לעסקה; גודל הפוזיציה = risk_ils / רוחב הסטופ.
-    slippage_points: הזזת כניסה לרעת הכיוון (מבחן עמידות).
+    risk_ils: הסיכון ההתחלתי ליחידה; גודל היחידה = risk_ils / רוחב הסטופ שלה.
+    slippage_points: הזזת כניסה לרעת הכיוון (מבחן עמידות). חלה גם על תוספות.
     fixed_target_points: אם ניתן — סוגר ברווח קבוע של X נק' (וריאנט השוואה,
                          לא חלק מהשיטה; בשביל "טארגט 5 נקודות").
+    pyramid_units: השערה 8 — פירמידינג בסגנון טרטלס. 1 = התנהגות הבסיס
+                   בדיוק (יחידה אחת). 2-4 = מוסיפים יחידה בכל פעם שנר
+                   נסגר pyramid_step_n×N מעבר לתוספת האחרונה (N = ATR14
+                   על 4h בכניסה). תוספת על סגירת נר בלבד — שמרני, בלי
+                   ספקולציית תוך-נר. כל היחידות יוצאות יחד על הסטופ
+                   הנגרר. שים לב: כל יחידה מסכנת risk_ils נוסף —
+                   pyramid_units=4 מכפיל את הסיכון פי ~4.
     """
     ew = entry_days * CANDLES_PER_DAY_4H
     tw = trail_days * CANDLES_PER_DAY_4H
     spread_pts = _spread_points()
     pos = None
     closed = []
+
+    def _close_pos(p, exit_px, when, open_at_end=False):
+        total = 0.0
+        for u in p["units"]:
+            pts_u = (exit_px - u["e"]) if p["dir"] == "long" else (u["e"] - exit_px)
+            total += (pts_u - spread_pts) * u["ipp"]
+        pts0 = (exit_px - p["entry"]) if p["dir"] == "long" else (p["entry"] - exit_px)
+        days_held = max(0.0, (when - p["et"]).total_seconds() / 86400.0)
+        rec = {"pnl": total, "pts": pts0, "days": days_held,
+               "dir": p["dir"], "et": p["et"], "ct": when,
+               "units": len(p["units"])}
+        if open_at_end:
+            rec["open_at_end"] = True
+        closed.append(rec)
+
     for i in range(ew, len(h4)):
         c = h4[i]
         hh = max(x["h"] for x in h4[i - ew:i])       # שיא N ימים (עד הנר הקודם)
@@ -1674,8 +1711,14 @@ def _simulate_slow(h4, entry_days=10, trail_days=5, risk_ils=SLOW_RISK_ILS,
                 stop_pts = abs(entry - trail)
                 if stop_pts < 1e-6:
                     continue
+                # N לפירמידינג: ATR14 על 4h בזמן הכניסה (משתמש בעבר בלבד)
+                w = h4[max(0, i - 30):i + 1]
+                n_atr = calc_atr([x["h"] for x in w], [x["l"] for x in w],
+                                 [x["c"] for x in w]) if pyramid_units > 1 else None
                 pos = {"dir": direction, "entry": entry, "trail": trail,
-                       "stop_pts": stop_pts, "ils_per_pt": risk_ils / stop_pts,
+                       "stop_pts": stop_pts,
+                       "units": [{"e": entry, "ipp": risk_ils / stop_pts}],
+                       "last_add": entry, "n_atr": n_atr,
                        "et": c["t"]}
             continue
         # עדכון סטופ נגרר — מתהדק בלבד
@@ -1685,6 +1728,28 @@ def _simulate_slow(h4, entry_days=10, trail_days=5, risk_ils=SLOW_RISK_ILS,
             pos["trail"] = max(pos["trail"], t_lo)
         else:
             pos["trail"] = min(pos["trail"], t_hi)
+
+        # השערה 8: תוספות פירמידינג — רק על סגירת נר מעבר לטריגר
+        if pyramid_units > 1 and pos.get("n_atr") and len(pos["units"]) < pyramid_units:
+            step = pyramid_step_n * pos["n_atr"]
+            while len(pos["units"]) < pyramid_units:
+                if pos["dir"] == "long":
+                    trigger = pos["last_add"] + step
+                    if c["c"] < trigger:
+                        break
+                    add_px = trigger + slippage_points
+                    dist = add_px - pos["trail"]
+                else:
+                    trigger = pos["last_add"] - step
+                    if c["c"] > trigger:
+                        break
+                    add_px = trigger - slippage_points
+                    dist = pos["trail"] - add_px
+                if dist < 1e-6:
+                    break  # הסטופ צמוד מדי ליחידה חדשה — לא מוסיפים
+                pos["units"].append({"e": add_px, "ipp": risk_ils / dist})
+                pos["last_add"] = trigger
+
         exit_px = None
         # וריאנט טארגט קבוע (להשוואה בלבד)
         if fixed_target_points is not None:
@@ -1698,21 +1763,13 @@ def _simulate_slow(h4, entry_days=10, trail_days=5, risk_ils=SLOW_RISK_ILS,
             elif pos["dir"] == "short" and c["h"] >= pos["trail"]:
                 exit_px = max(pos["trail"], c["o"]) if "o" in c else pos["trail"]
         if exit_px is not None:
-            pts = (exit_px - pos["entry"]) if pos["dir"] == "long" else (pos["entry"] - exit_px)
-            pnl = (pts - spread_pts) * pos["ils_per_pt"]
-            days_held = max(0.0, (c["t"] - pos["et"]).total_seconds() / 86400.0)
-            closed.append({"pnl": pnl, "pts": pts, "days": days_held,
-                           "dir": pos["dir"], "et": pos["et"], "ct": c["t"]})
+            _close_pos(pos, exit_px, c["t"])
             pos = None
     # פוזיציה שנותרה פתוחה בסוף הנתונים — נסגרת לפי המחיר האחרון (mark-to-market),
     # אחרת מגמה ארוכה שלא נשברה לא נספרת בכלל בדוח
     if pos is not None and h4:
         last = h4[-1]
-        pts = (last["c"] - pos["entry"]) if pos["dir"] == "long" else (pos["entry"] - last["c"])
-        pnl = (pts - spread_pts) * pos["ils_per_pt"]
-        days_held = max(0.0, (last["t"] - pos["et"]).total_seconds() / 86400.0)
-        closed.append({"pnl": pnl, "pts": pts, "days": days_held,
-                       "dir": pos["dir"], "et": pos["et"], "ct": last["t"], "open_at_end": True})
+        _close_pos(pos, last["c"], last["t"], open_at_end=True)
         pos = None
     wins = [x for x in closed if x["pnl"] > 0]
     losses = [x for x in closed if x["pnl"] <= 0]
@@ -1725,6 +1782,9 @@ def _simulate_slow(h4, entry_days=10, trail_days=5, risk_ils=SLOW_RISK_ILS,
         "avg_win": round(sum(x["pnl"] for x in wins) / len(wins), 1) if wins else 0.0,
         "avg_loss": round(sum(x["pnl"] for x in losses) / len(losses), 1) if losses else 0.0,
         "avg_days": round(sum(x["days"] for x in closed) / n, 1) if n else 0.0,
+        "worst": round(min((x["pnl"] for x in closed), default=0.0), 1),
+        "avg_units": round(sum(x.get("units", 1) for x in closed) / n, 2) if n else 0.0,
+        "max_units": max((x.get("units", 1) for x in closed), default=0),
         "detail": closed,
     }
 
@@ -1754,6 +1814,24 @@ def slow_scan_and_monitor(data):
 
     open_trade = next((t for t in data.get("trades", [])
                        if t.get("system") == 2 and t.get("status") == "open"), None)
+
+    # --- 3.6.0: shadow שיטה 2, ניטור בכל סריקה — רישום בלבד, לא שולח כלום ---
+    # עוקב אחרי כל איתות פריצה כאילו נכנס, בלי תלות בכפתורים/עסקה אמיתית.
+    ssh = data.setdefault("slow_shadow", [])
+    sh_open = next((s for s in ssh if s.get("status") == "open"), None)
+    if sh_open:
+        _sl = sh_open["direction"] == "קנייה"
+        if (_sl and current_price <= sh_open["stop"]) or ((not _sl) and current_price >= sh_open["stop"]):
+            _xp = sh_open["stop"]
+            _pts = (_xp - sh_open["entry"]) if _sl else (sh_open["entry"] - _xp)
+            _pnl = (_pts - spread_pts) * sh_open.get("ils_per_pt", 0)
+            sh_open["status"] = "closed"
+            sh_open["result"] = "win" if _pnl > 0 else "loss"
+            sh_open["pnl"] = round(_pnl, 2)
+            sh_open["exit"] = round(_xp, 2)
+            sh_open["close_time"] = now.isoformat()
+            save_data(data)
+            print(f"[SLOW-SHADOW] נסגרה: {sh_open['result']} {_pnl:+.1f}", flush=True)
 
     # --- ניטור עסקה פתוחה: חציית סטופ נגרר → סגירה אוטומטית ---
     if open_trade:
@@ -1785,6 +1863,35 @@ def slow_scan_and_monitor(data):
     if state.get("last_candle") == last_key:
         return
     state["last_candle"] = last_key
+
+    # 3.6.0: shadow שיטה 2 על נר סגור — רץ תמיד, גם כשיש עסקה אמיתית פתוחה
+    sh_open = next((s for s in data.get("slow_shadow", []) if s.get("status") == "open"), None)
+    if sh_open:
+        _win = closed_candles[-tw:]
+        _sl = sh_open["direction"] == "קנייה"
+        _nt = min(x["l"] for x in _win) if _sl else max(x["h"] for x in _win)
+        if (_sl and _nt > sh_open["stop"]) or ((not _sl) and _nt < sh_open["stop"]):
+            sh_open["stop"] = round(_nt, 2)
+            save_data(data)
+    else:
+        _prior = closed_candles[-(ew + 1):-1]
+        _hh = max(x["h"] for x in _prior)
+        _ll = min(x["l"] for x in _prior)
+        _d = "קנייה" if last_closed["c"] > _hh else ("מכירה" if last_closed["c"] < _ll else None)
+        if _d:
+            _e = round(last_closed["c"], 2)
+            _tw2 = closed_candles[-tw:]
+            _tr = round(min(x["l"] for x in _tw2) if _d == "קנייה" else max(x["h"] for x in _tw2), 2)
+            _sp = abs(_e - _tr)
+            if _sp > 1e-6:
+                data.setdefault("slow_shadow", []).append({
+                    "direction": _d, "entry": _e, "stop": _tr,
+                    "ils_per_pt": round(SLOW_RISK_ILS / _sp, 4),
+                    "entry_time": now.isoformat(), "candle": last_key,
+                    "status": "open"
+                })
+                save_data(data)
+                print(f"[SLOW-SHADOW] נפתחה: {_d} @{_e} trail {_tr}", flush=True)
 
     if open_trade:
         # עדכון סטופ נגרר — מתהדק בלבד
@@ -1915,6 +2022,126 @@ def run_slow_report():
         text = text[cut + 1:]
     msgs.append(text)
     return msgs
+
+def run_h9_backtest():
+    """‏/h9 — חלון הפעילות (שיטה 1). ההנחה היחידה שמעולם לא נבדקה:
+    הבוט ער 08:00-21:00 וחוסם כניסות מ-19:00. שני המהלכים הגדולים של
+    28-29/07 קרו כשהוא כבוי. כאן בודקים חלונות רחבים יותר — כולל 24 שעות.
+    שים לב: הבסיס כאן הוא החלון החי (8-22 עם חיתוך 19:00), ולכן ההשוואה
+    היא 'מה היה קורה אילו הבוט היה ער', לא עוד פילטר כניסות."""
+    symbol = list(SYMBOLS.values())[0]
+    m15 = _fetch_history(symbol, "15min", 2900)
+    h1 = _fetch_history(symbol, "1h", 800)
+    if not m15 or not h1 or len(m15) < 200 or len(h1) < 100:
+        return ["⚠️ לא הצלחתי למשוך מספיק נתונים היסטוריים. נסה שוב מאוחר יותר."]
+
+    # כמה מהנרות בכלל קיימים מחוץ לחלון? (בדיקת שפיות לנתונים)
+    night = sum(1 for c in m15 if not (8 <= c["t"].hour < 22))
+    date_from, date_to = m15[0]["t"].strftime("%d/%m"), m15[-1]["t"].strftime("%d/%m")
+    live = dict(stop_floor_pct=STOP_FLOOR_PCT, max_stretch_pct=MAX_STRETCH_PCT,
+                rsi_extreme_block=True, last_entry_hour=LAST_ENTRY_HOUR)
+
+    base = _simulate(m15, h1, **live)
+    parts = [f"🌙 <b>/h9 — חלון הפעילות | {date_from} עד {date_to}</b>\n"
+             f"נרות מחוץ לחלון החי בנתונים: {night} מתוך {len(m15)}\n\n"
+             f"<b>⚙️ בסיס (החלון החי: 08-22, חיתוך {LAST_ENTRY_HOUR}:00):</b>\n"
+             f"🔔 {base['trades']} עסק' | 📊 {base['win_rate']} | 💰 {base['pnl']:+.2f} ש\"ח\n"]
+
+    variants = []
+    lines = ["<b>🕐 גריד חלונות (חלון פעיל / שעת חיתוך):</b>"]
+    grid = [
+        ("8-22, חיתוך 21", dict(active_start=8, active_end=22, last_entry_hour=21)),
+        ("8-24, חיתוך 22", dict(active_start=8, active_end=24, last_entry_hour=22)),
+        ("6-24, חיתוך 22", dict(active_start=6, active_end=24, last_entry_hour=22)),
+        ("24 שעות, חיתוך 22", dict(active_start=0, active_end=24, last_entry_hour=22)),
+        ("24 שעות, בלי חיתוך", dict(active_start=0, active_end=24, last_entry_hour=None)),
+        ("14-24 (אחה\"צ+ערב)", dict(active_start=14, active_end=24, last_entry_hour=None)),
+    ]
+    for label, kw in grid:
+        full = dict(live); full.update(kw)
+        r = _simulate(m15, h1, **full)
+        variants.append((label, kw, r))
+        lines.append(f"  {label}: {r['trades']} עסק' | {r['win_rate']} | "
+                     f"{r['pnl']:+.0f} ש\"ח ({r['pnl'] - base['pnl']:+.0f})")
+    parts.append("\n".join(lines))
+
+    best_label, best_kw, best_r = max(variants, key=lambda x: x[2]["pnl"])
+    verdict = []
+    if best_r["pnl"] > base["pnl"]:
+        verdict.append(f"\n🧪 <b>מבחן עמידות לחלון הטוב ({best_label}):</b>")
+        robust = True
+        for slip in (3.0, 6.0, 10.0):
+            full = dict(live); full.update(best_kw); full["slippage_points"] = slip
+            rs = _simulate(m15, h1, **full)
+            verdict.append(f"  ‏{slip:.0f} נק' נגד: {rs['win_rate']} | {rs['pnl']:+.0f} ש\"ח "
+                           f"({rs['pnl'] - base['pnl']:+.0f} מול בסיס ללא הזזה)")
+            if rs["pnl"] <= base["pnl"]:
+                robust = False
+        verdict.append("\n✅ שורד עמידות — מועמד ליישום." if robust
+                       else "\n⚠️ קורס תחת הזזה — יתרון לא אמיתי.")
+        verdict.append("⚠️ שים לב: הרחבת שעות דורשת גם שהבוט ירוץ בפועל בשעות האלה "
+                       "(שינוי בקוד החי) — ושהספרד בלילה לרוב רחב יותר מהמודל כאן.")
+    else:
+        verdict.append("\n❌ אף חלון מורחב לא שיפר את הבסיס — שעות הפעילות אינן הבעיה.")
+    parts.append("\n".join(verdict))
+    return parts
+
+def run_h8_backtest():
+    """‏/h8 — השערה 8: פירמידינג בסגנון טרטלס על שיטה 2.
+    בסיס = הקומבינציה החיה (20/3, יחידה אחת). גריד: 2/3/4 יחידות בצעד
+    0.5N, ואז הטוב שבהם בצעד 1.0N. עמידות 3/6/10 נק' לטוב ביותר.
+    פירמידינג מכפיל סיכון — לכן מדווחים גם הפסד-מצרפי-גרוע וכמות
+    יחידות ממוצעת/מקס'. מחזירה רשימת הודעות."""
+    symbol = list(SYMBOLS.values())[0]
+    h4 = _fetch_history(symbol, "4h", 3000)
+    if not h4 or len(h4) < 400:
+        return ["⚠️ משיכת נרות 4 שעות נכשלה או קצרה מדי. נסה שוב מאוחר יותר."]
+    span_days = (h4[-1]["t"] - h4[0]["t"]).days
+
+    base = _simulate_slow(h4, entry_days=SLOW_ENTRY_DAYS, trail_days=SLOW_TRAIL_DAYS)
+    parts = [f"🧪 <b>/h8 — פירמידינג (שיטה 2) | ~{span_days} ימים, {len(h4)} נרות</b>\n"
+             f"מוסיפים יחידה ({SLOW_RISK_ILS:.0f} ש\"ח סיכון) כל פעם שנר נסגר "
+             f"צעד×N מעבר לתוספת האחרונה (N=ATR14). כל היחידות יוצאות יחד על הנגרר.\n\n"
+             f"<b>⚙️ בסיס (20/3, יחידה אחת):</b>\n"
+             f"🔔 {base['trades']} עסק' | 📊 {base['win_rate']} | 💰 {base['pnl']:+.0f} ש\"ח\n"
+             f"ממוצע ✅{base['avg_win']:+.0f}/❌{base['avg_loss']:+.0f} | "
+             f"הפסד מצרפי גרוע: {base['worst']:+.0f} ש\"ח\n"]
+
+    variants = []
+    lines = ["<b>🔺 גריד יחידות (צעד 0.5N):</b>"]
+    for u in (2, 3, 4):
+        kw = dict(pyramid_units=u, pyramid_step_n=0.5)
+        r = _simulate_slow(h4, entry_days=SLOW_ENTRY_DAYS, trail_days=SLOW_TRAIL_DAYS, **kw)
+        variants.append((f"{u} יח' @0.5N", kw, r))
+        lines.append(f"  {u} יח': {r['win_rate']} | {r['pnl']:+.0f} ש\"ח ({r['pnl'] - base['pnl']:+.0f}) | "
+                     f"גרוע: {r['worst']:+.0f} | יח' בפועל: ממוצע {r['avg_units']}, מקס' {r['max_units']}")
+    best_u_label, best_u_kw, best_u_r = max(variants, key=lambda x: x[2]["pnl"])
+    kw_1n = dict(best_u_kw); kw_1n["pyramid_step_n"] = 1.0
+    r1n = _simulate_slow(h4, entry_days=SLOW_ENTRY_DAYS, trail_days=SLOW_TRAIL_DAYS, **kw_1n)
+    variants.append((best_u_label.replace("@0.5N", "@1.0N"), kw_1n, r1n))
+    lines.append(f"  צעד 1.0N ({best_u_kw['pyramid_units']} יח'): {r1n['win_rate']} | {r1n['pnl']:+.0f} ש\"ח "
+                 f"({r1n['pnl'] - base['pnl']:+.0f}) | גרוע: {r1n['worst']:+.0f}")
+    parts.append("\n".join(lines))
+
+    best_label, best_kw, best_r = max(variants, key=lambda x: x[2]["pnl"])
+    verdict = []
+    if best_r["pnl"] > base["pnl"]:
+        verdict.append(f"\n🧪 <b>מבחן עמידות לטוב ({best_label}):</b>")
+        robust = True
+        for slip in (3.0, 6.0, 10.0):
+            rs = _simulate_slow(h4, entry_days=SLOW_ENTRY_DAYS, trail_days=SLOW_TRAIL_DAYS,
+                                slippage_points=slip, **best_kw)
+            verdict.append(f"  ‏{slip:.0f} נק' נגד: {rs['win_rate']} | {rs['pnl']:+.0f} ש\"ח | גרוע: {rs['worst']:+.0f}")
+            if rs["pnl"] <= base["pnl"]:
+                robust = False
+        verdict.append("\n✅ שורד עמידות — מועמד ליישום." if robust
+                       else "\n⚠️ קורס תחת הזזה — יתרון לא אמיתי.")
+        verdict.append("⚠️ לפני יישום: ההפסד המצרפי הגרוע הוא הסיכון האמיתי לעסקה — "
+                       "ודא שהוא מתאים לחשבון (כל יחידה = עוד 40 ש\"ח סיכון).")
+    else:
+        verdict.append("\n❌ אף וריאנט פירמידינג לא שיפר את הבסיס — ההשערה לא מאושרת על המדגם.")
+    parts.append("\n".join(verdict))
+    return parts
 
 # ============================================================
 # 3.4.2: הצלבת מנוע מול מציאות — פקודת /cross בטלגרם
@@ -2393,6 +2620,47 @@ def handle_callbacks(data, last_update_id):
                     send_telegram(f"⚠️ הבדיקה נכשלה: {e}")
                 continue
 
+            # 3.6.1: /h9 — חלון הפעילות (שיטה 1)
+            if text.lower() in ("/h9", "h9", "השערה9", "השערה 9"):
+                send_telegram("⏳ בודק חלונות פעילות (כולל 24 שעות) על ~30 ימים...")
+                try:
+                    for _part in run_h9_backtest():
+                        send_telegram(_part)
+                except Exception as e:
+                    send_telegram(f"⚠️ הבדיקה נכשלה: {e}")
+                continue
+
+            # 3.6.0: /h8 — פירמידינג על שיטה 2
+            if text.lower() in ("/h8", "h8", "השערה8", "השערה 8"):
+                send_telegram("⏳ בודק פירמידינג (שיטה 2) על ~570 ימים...")
+                try:
+                    for _part in run_h8_backtest():
+                        send_telegram(_part)
+                except Exception as e:
+                    send_telegram(f"⚠️ הבדיקה נכשלה: {e}")
+                continue
+
+            # 3.6.0: /shadow2 — סיכום ה-shadow של שיטה 2
+            if text.lower() in ("/shadow2", "shadow2", "צל2"):
+                try:
+                    _ssh = data.get("slow_shadow", [])
+                    _cl = [s for s in _ssh if s.get("status") == "closed"]
+                    _op = next((s for s in _ssh if s.get("status") == "open"), None)
+                    _w = [s for s in _cl if s.get("result") == "win"]
+                    _msg = [f"🐢👥 <b>Shadow שיטה 2</b>",
+                            f"נסגרו: {len(_cl)} | ✅ {len(_w)} | 💰 {sum(s.get('pnl', 0) for s in _cl):+.2f} ש\"ח"]
+                    if _op:
+                        _msg.append(f"פתוחה: {_op['direction']} @{_op['entry']} | נגרר: {_op['stop']} "
+                                    f"(מ-{_op.get('entry_time', '')[:16]})")
+                    else:
+                        _msg.append("אין פוזיציית shadow פתוחה כרגע.")
+                    if not _ssh:
+                        _msg.append("(המעקב התחיל בגרסה 3.6.0 — הרשומות יצטברו עם האיתותים הבאים)")
+                    send_telegram("\n".join(_msg))
+                except Exception as e:
+                    send_telegram(f"⚠️ שגיאה: {e}")
+                continue
+
             # 3.4.1: ניתוח MFE — "טארגט רחוק מדי?" מול "כניסה מאוחרת?"
             if text.lower() in ("/mfe", "mfe", "ניתוח"):
                 send_telegram("⏳ מנתח את כל העסקאות הסגורות מול נרות היסטוריים...")
@@ -2443,7 +2711,8 @@ def handle_callbacks(data, last_update_id):
                             trend_txt = f"{state} ({tr['deviation_pct']:+.2f}% מ-EMA50)"
                     except Exception:
                         pass
-                    in_hours = 8 <= now.hour < 22
+                    _th = TRADING_HOURS.get("זהב", {"start": 6, "end": 22})
+                    in_hours = _th["start"] <= now.hour < _th["end"]
                     evening = now.hour >= LAST_ENTRY_HOUR
                     send_telegram(
                         f"🩺 <b>סטטוס — גרסה 3.4</b>\n"
@@ -2735,7 +3004,7 @@ def send_daily_report(data):
 # לולאה ראשית
 # ============================================================
 def main():
-    print("🤖 בוט מסחר מופעל! [גרסה 3.5.3 — שיטה 2 חיה 🐢 + הישנה במעקב בלבד + /h1 /h2 /h3]", flush=True)
+    print("🤖 בוט מסחר מופעל! [גרסה 3.6.2 — חלון 06:00-22:00 + shadow2 לשיטה 2]", flush=True)
     print(f"TOKEN exists: {bool(TELEGRAM_TOKEN)}", flush=True)
     print(f"CHAT_ID: {CHAT_ID}", flush=True)
     print(f"GIST configured: {gist_enabled()}", flush=True)
@@ -2753,13 +3022,13 @@ def main():
         storage_line = "⚠️ אחסון זמני בלבד (/tmp) — הגדר GIST_ID + GIST_TOKEN ב-Render"
 
     send_telegram(
-        "🤖 <b>בוט המסחר הופעל!</b> (גרסה 3.5.3)\n\n"
+        "🤖 <b>בוט המסחר הופעל!</b> (גרסה 3.6.2)\n\n"
         "🐢 <b>שיטה 2 — למסחר:</b> פריצת 20 ימים על נר 4 שעות,\n"
         "סטופ נגרר, בלי טארגט. איתות עם כפתורים = אמיתי.\n"
         "צפי: 1-2 איתותים בשבוע. שקט = תקין.\n\n"
         "🚨 <b>המערכת הישנה — מעקב בלבד:</b> בלי כפתורים,\n"
         "לא למסחר. הסימולציה ממשיכה לרשום אותה.\n\n"
-        "💡 /backtest | /h1 | /h2 | /h3 | /status | /mfe | /cross | /slow\n"
+        "💡 /backtest | /h1 | /h2 | /h3 | /h8 | /h9 | /shadow2 | /status | /mfe | /cross | /slow\n"
         f"{storage_line}"
     )
 
@@ -2816,7 +3085,7 @@ def main():
                 last_daily_report = today_key
 
             # --- פינג בוקר (פעם ביום) ---
-            if now.hour == 8 and now.minute < 11 and last_morning_ping != today_key:
+            if now.hour == TRADING_HOURS["זהב"]["start"] and now.minute < 11 and last_morning_ping != today_key:
                 send_telegram(f"✅ בוט פעיל | {now.strftime('%d/%m/%Y')}")
                 last_morning_ping = today_key
 
