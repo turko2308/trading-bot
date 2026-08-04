@@ -62,6 +62,14 @@ MAX_PARALLEL_TRADES = 2
 SIGNAL_COOLDOWN_MINUTES = 30
 TRADE_TIMEOUT_HOURS = 6
 
+# 3.6.4: יעד/סטופ קבועים בדולרים, לפי סגנון המסחר של המשתמש
+# (כניסה ויציאה מהירה, 2-3 עסקאות, סוגר באותו יום).
+# None = חזרה לחישוב הישן לפי ATR (טארגט = פי 2 מהסטופ).
+# ⚠️ מהנתונים (2.5 שנים, 1.5 אונקיות): 10$/8$ = 45% הצלחה,
+# ‏2.90- ש"ח לעסקה. זה התא הפחות גרוע מבין 12 שנבדקו, לא תא רווחי.
+FIXED_TARGET_USD = 10.0
+FIXED_STOP_USD = 8.0
+
 # מגבלת הפסד יומית — מנוטרלת לבינתיים (לשלב בדיקות)
 DAILY_LOSS_LIMIT = None
 
@@ -374,7 +382,27 @@ def get_prices(symbol, interval="15min", outputsize=50):
                 last_time = last_time.replace(tzinfo=IL_TZ)
         except Exception:
             pass
-        return {"closes": closes, "highs": highs, "lows": lows, "last_time": last_time}
+        # 3.6.3 (תיקון באג): הנר האחרון שהספק מחזיר הוא הנר שמתהווה כרגע —
+        # RSI/MACD/ADX/בולינגר/פריצה חושבו עליו עד כה, כלומר על נתון חלקי
+        # שמשתנה כל דקה. זה גם מה שהבדיל את הבוט החי ממנוע ה-backtest,
+        # שתמיד עבד על נרות סגורים. מעכשיו: אינדיקטורים על נרות סגורים,
+        # והמחיר החי משמש רק כמחיר כניסה.
+        live_price = closes[-1]
+        forming = False
+        if last_time is not None and len(closes) > 2:
+            try:
+                mins = int("".join(ch for ch in interval if ch.isdigit()) or 0)
+                if "h" in interval and "min" not in interval:
+                    mins *= 60
+                if mins and (now_il() - last_time).total_seconds() < mins * 60:
+                    forming = True
+            except Exception:
+                forming = False
+        if forming:
+            closes, highs, lows = closes[:-1], highs[:-1], lows[:-1]
+        return {"closes": closes, "highs": highs, "lows": lows,
+                "last_time": last_time, "live_price": live_price,
+                "forming": forming}
     except Exception as e:
         print(f"שגיאה בשליפת נתונים {symbol}: {e}", flush=True)
         return None
@@ -425,7 +453,8 @@ def get_trend_filter(symbol_code):
             "symbol": symbol_code,
             "interval": TREND_INTERVAL,
             "outputsize": 200,
-            "apikey": TWELVEDATA_KEY
+            "apikey": TWELVEDATA_KEY,
+            "timezone": "Asia/Jerusalem"   # 3.6.3: היה חסר — הפיד היה ב-UTC
         }
         r = requests.get(url, params=params, timeout=15)
         data = r.json()
@@ -670,7 +699,11 @@ def analyze_and_signal(symbol_name, symbol_code, data):
     closes = prices_data["closes"]
     highs = prices_data["highs"]
     lows = prices_data["lows"]
-    current = closes[-1]
+    # 3.6.3: closes/highs/lows = נרות סגורים בלבד (לאינדיקטורים).
+    # current = המחיר החי, לשימוש כמחיר כניסה/סטופ/טארגט בלבד.
+    current = prices_data.get("live_price", closes[-1])
+    if prices_data.get("forming"):
+        print(f"[{symbol_name}] אינדיקטורים על {len(closes)} נרות סגורים | מחיר חי {current}", flush=True)
 
     # --- אינדיקטורים ---
     rsi = calc_rsi(closes)
@@ -678,7 +711,7 @@ def analyze_and_signal(symbol_name, symbol_code, data):
     bb_upper, bb_mid, bb_lower = calc_bollinger(closes)
     atr = calc_atr(highs, lows, closes)
     adx = calc_adx(highs, lows, closes)
-    breakout_dir = check_breakout(closes, highs, lows)
+    breakout_dir = check_breakout(closes + [current], highs + [current], lows + [current])
 
     # --- פילטר מגמה קשה: EMA50 על 1h קובע איזה כיוון בכלל מותר ---
     trend = get_trend_filter(symbol_code)
@@ -794,28 +827,35 @@ def analyze_and_signal(symbol_name, symbol_code, data):
     if open_trade and open_trade["direction"] != direction:
         reversal_warning = f"\n⚠️ <b>היפוך כיוון!</b> יש עסקה פתוחה ב{open_trade['direction']}\n"
 
-    if atr:
-        stop_distance = atr * 1.5
+    if FIXED_STOP_USD is not None:
+        # 3.6.4: סטופ קבוע בדולרים — רצפת ה-0.35% לא חלה כאן
+        stop_distance = FIXED_STOP_USD
     else:
-        stop_distance = current * 0.005
-    # רצפת סטופ: מינימום 0.35% מהמחיר, שהסטופ לא יישב בתוך הרעש
-    if STOP_FLOOR_PCT is not None:
-        stop_distance = max(stop_distance, current * STOP_FLOOR_PCT / 100)
+        if atr:
+            stop_distance = atr * 1.5
+        else:
+            stop_distance = current * 0.005
+        # רצפת סטופ: מינימום 0.35% מהמחיר, שהסטופ לא יישב בתוך הרעש
+        if STOP_FLOOR_PCT is not None:
+            stop_distance = max(stop_distance, current * STOP_FLOOR_PCT / 100)
+    # מרחק היעד: קבוע בדולרים, או פי 2 מהסטופ (הישן)
+    target_distance = FIXED_TARGET_USD if FIXED_TARGET_USD is not None else stop_distance * 2
 
     entry_price = round(current, 2)
-    tp2_mult = 4 if stars >= 4 else 3
 
     risk_amount = round(points_to_ils(stop_distance) + SPREAD_COST_ILS, 2)
     risk_pct = round(risk_amount / ACCOUNT_SIZE * 100, 1)
 
+    # target2 = יעד מידע בלבד (לא נסגר עליו) — פי 1.5/2 מהיעד הראשון
+    t2_dist = target_distance * (2 if stars >= 4 else 1.5)
     if direction == "קנייה":
         stop = round(current - stop_distance, 2)
-        target1 = round(current + stop_distance * 2, 2)
-        target2 = round(current + stop_distance * tp2_mult, 2)
+        target1 = round(current + target_distance, 2)
+        target2 = round(current + t2_dist, 2)
     else:
         stop = round(current + stop_distance, 2)
-        target1 = round(current - stop_distance * 2, 2)
-        target2 = round(current - stop_distance * tp2_mult, 2)
+        target1 = round(current - target_distance, 2)
+        target2 = round(current - t2_dist, 2)
 
     now = now_il()
 
@@ -3004,7 +3044,7 @@ def send_daily_report(data):
 # לולאה ראשית
 # ============================================================
 def main():
-    print("🤖 בוט מסחר מופעל! [גרסה 3.6.2 — חלון 06:00-22:00 + shadow2 לשיטה 2]", flush=True)
+    print("🤖 בוט מסחר מופעל! [גרסה 3.6.4 — יעד 10$ / סטופ 8$ + נרות סגורים]", flush=True)
     print(f"TOKEN exists: {bool(TELEGRAM_TOKEN)}", flush=True)
     print(f"CHAT_ID: {CHAT_ID}", flush=True)
     print(f"GIST configured: {gist_enabled()}", flush=True)
@@ -3022,7 +3062,7 @@ def main():
         storage_line = "⚠️ אחסון זמני בלבד (/tmp) — הגדר GIST_ID + GIST_TOKEN ב-Render"
 
     send_telegram(
-        "🤖 <b>בוט המסחר הופעל!</b> (גרסה 3.6.2)\n\n"
+        "🤖 <b>בוט המסחר הופעל!</b> (גרסה 3.6.4)\n\n"
         "🐢 <b>שיטה 2 — למסחר:</b> פריצת 20 ימים על נר 4 שעות,\n"
         "סטופ נגרר, בלי טארגט. איתות עם כפתורים = אמיתי.\n"
         "צפי: 1-2 איתותים בשבוע. שקט = תקין.\n\n"
