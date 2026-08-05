@@ -1838,6 +1838,183 @@ def _simulate_slow(h4, entry_days=10, trail_days=5, risk_ils=SLOW_RISK_ILS,
         "detail": closed,
     }
 
+# ============================================================
+# שיטה 3 📊 — ליבת מגמה על מסגרות זמן גבוהות (4H + 6H)
+# ============================================================
+# הרקע (בדיקה על 2.5 שנות נתוני Dukascopy, 1.5 אונקיות):
+#   הספרד קבוע 0.77$ — הוא 15% מתנועה של 5$ אבל 1.5% מתנועה של 50$.
+#   זו הסיבה היחידה שהמסגרות הגבוהות עוברות בזמן ש-15 דק' נכשלת.
+#
+#   4H: 247 עסק' | 55% | ‏6,167+ | שורד 3$ החלקה | 4 מ-5 תקופות חיוביות
+#   6H: 164 עסק' | 62% | ‏11,720+ | שורד 3$ החלקה | 5 מ-5 תקופות חיוביות
+#       Monte Carlo (2000 ערבובים): ירידה חציונית ‏2,179-, גרועה ‏5,722-
+#       Bootstrap (2000 דגימות): 99.7% הסתברות לרווח
+#       נשאר רווחי גם בספרד פי 10 (8$ → ‏6,402+)
+#
+# הערות המבקר החיצוני שמיושמות כאן:
+#   • אפס אופטימיזציה — הפרמטרים קפואים כפי שנבדקו. כל שינוי מאפס את האישורים.
+#   • Forward test — מעקב בלבד, בלי כסף, עד שיצטברו מספיק איתותים חיים.
+#   • ניהול סיכון הוא הבעיה, לא האלגוריתם — לכן כל איתות מציג את גודל
+#     הפוזיציה הנדרש ואת החשבון המינימלי.
+#   • המדגם דק (164 עסקאות) — מוצג בהודעה כדי שלא יישכח.
+# ============================================================
+
+# worst_dd = הירידה המצטברת הגרועה ביותר מ-Monte Carlo (2000 ערבובים),
+# מדודה ב-1.5 אונקיות. זה המספר שקובע גודל פוזיציה — לא הסיכון בעסקה
+# בודדת, כי מה שמוחק חשבון הוא רצף הפסדים ולא עסקה אחת.
+# כל מסגרת מציגה שתי תוכניות יציאה על אותה כניסה ואותו סטופ:
+#   far  = יעד 2×ATR — הכי רווחי (‏71 ש"ח/עסקה ב-6H), אבל ימים והרבה הפסדים
+#   near = יעד 10$ קבוע — 87% הצלחה ב-6H, יציאה מהירה, ‏9.65 ש"ח/עסקה
+# שתיהן נבדקו על אותם 2.5 שנים. הסטופ זהה — רק היעד משתנה.
+TF_CONFIGS = [
+    {"name": "4H", "hours": 4, "worst_dd": 8106, "med_dd": 3485,
+     "far": {"trades": 247, "wr": "55%", "pnl": "+6,167", "per": "+24.97", "periods": "4/5"},
+     "near": {"trades": 440, "wr": "82%", "pnl": "+639", "per": "+1.45"}},
+    {"name": "6H", "hours": 6, "worst_dd": 6009, "med_dd": 2172,
+     "far": {"trades": 164, "wr": "62%", "pnl": "+11,720", "per": "+71.47", "periods": "5/5"},
+     "near": {"trades": 326, "wr": "87%", "pnl": "+3,145", "per": "+9.65"}},
+]
+TF_NEAR_TARGET_USD = 10.0   # יעד קרוב קבוע
+TF_DD_BASE_OZ = 1.5        # גודל הפוזיציה שבו נמדדו הירידות
+TF_DD_BUDGET = 0.30        # אחוז מהחשבון שמותר לירידה הגרועה לצרוך
+TF_BREAKOUT_BARS = 20      # פריצת שיא/שפל של 20 נרות
+TF_EMA_PERIOD = 50         # מסנן מגמה
+TF_ATR_PERIOD = 14
+TF_STOP_ATR = 2.0          # סטופ = 2×ATR
+TF_TARGET_ATR = 2.0        # יעד = 2×ATR
+
+
+def _tf_aggregate(h1_bars, hours):
+    """מצרף נרות שעה לנרות של N שעות, מיושר לגבול השעה."""
+    out = []
+    cur = None
+    for b in h1_bars:
+        slot = b["t"].replace(minute=0, second=0, microsecond=0)
+        slot = slot.replace(hour=(slot.hour // hours) * hours)
+        if cur is None or cur["t"] != slot:
+            if cur:
+                out.append(cur)
+            cur = {"t": slot, "o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"]}
+        else:
+            cur["h"] = max(cur["h"], b["h"])
+            cur["l"] = min(cur["l"], b["l"])
+            cur["c"] = b["c"]
+    if cur:
+        out.append(cur)
+    return out
+
+
+def _tf_atr(bars, n=TF_ATR_PERIOD):
+    if len(bars) < n + 1:
+        return None
+    tr = []
+    for j in range(len(bars) - n, len(bars)):
+        pc = bars[j - 1]["c"]
+        tr.append(max(bars[j]["h"] - bars[j]["l"],
+                      abs(bars[j]["h"] - pc), abs(pc - bars[j]["l"])))
+    return sum(tr) / n
+
+
+def tf_scan(data):
+    """סורק 4H ו-6H. מעקב בלבד — בלי כפתורים, בלי כסף."""
+    symbol = list(SYMBOLS.values())[0]
+    h1 = _fetch_history(symbol, "1h", 800)
+    if not h1 or len(h1) < 400:
+        return
+
+    now = now_il().replace(tzinfo=None)
+    state = data.setdefault("tf_state", {})
+    log = data.setdefault("tf_signals", [])
+    changed = False
+
+    for cfg in TF_CONFIGS:
+        hrs, name = cfg["hours"], cfg["name"]
+        bars = _tf_aggregate(h1, hrs)
+        # רק נרות שנסגרו — הנר האחרון עדיין נבנה
+        closed = [b for b in bars if b["t"] + datetime.timedelta(hours=hrs) <= now]
+        if len(closed) < TF_EMA_PERIOD + TF_BREAKOUT_BARS + 5:
+            continue
+        last = closed[-1]
+        key = last["t"].isoformat()
+        if state.get(name) == key:
+            continue                      # הנר הזה כבר טופל
+        state[name] = key
+        changed = True
+
+        closes = [b["c"] for b in closed]
+        ema = calc_ema_series(closes, TF_EMA_PERIOD)[-1]
+        prior = closed[-(TF_BREAKOUT_BARS + 1):-1]
+        hh = max(b["h"] for b in prior)
+        ll = min(b["l"] for b in prior)
+        c = last["c"]
+
+        direction = None
+        if c > hh and c > ema:
+            direction = "קנייה"
+        elif c < ll and c < ema:
+            direction = "מכירה"
+        if not direction:
+            continue
+
+        atr = _tf_atr(closed)
+        if not atr:
+            continue
+        is_long = direction == "קנייה"
+        stop = c - TF_STOP_ATR * atr if is_long else c + TF_STOP_ATR * atr
+        target = c + TF_TARGET_ATR * atr if is_long else c - TF_TARGET_ATR * atr
+        near = c + TF_NEAR_TARGET_USD if is_long else c - TF_NEAR_TARGET_USD
+        risk_usd = abs(c - stop)
+        # גודל פוזיציה לפי הירידה המצטברת הגרועה, לא לפי עסקה בודדת
+        max_oz = TF_DD_BASE_OZ * (ACCOUNT_SIZE * TF_DD_BUDGET) / cfg["worst_dd"]
+        need_acct = cfg["worst_dd"] * 0.75 / TF_DD_BASE_OZ / TF_DD_BUDGET
+
+        log.append({
+            "tf": name, "direction": direction, "entry": round(c, 2),
+            "stop": round(stop, 2), "target": round(target, 2),
+            "target_near": round(near, 2),
+            "atr": round(atr, 2), "candle": key,
+            "time": now_il().isoformat(), "status": "open"
+        })
+
+        msg = (
+            f"📊 <b>[מעקב בלבד] שיטה 3 — מסגרת {name}</b>\n"
+            f"🕐 {now_il().strftime('%d/%m %H:%M')} | נר {name} שנסגר\n"
+            f"{'─' * 22}\n"
+            f"📊 כיוון: <b>{direction}</b>\n"
+            f"💰 כניסה: {c:.2f}\n"
+            f"🛑 סטופ: {stop:.2f}  ({risk_usd:.1f}$)  — זהה לשתי התוכניות\n"
+            f"📏 ATR({TF_ATR_PERIOD}) = {atr:.2f}$\n"
+            f"{'─' * 22}\n"
+            f"🎯 <b>שתי תוכניות יציאה</b>\n"
+            f"🐢 רחוק: {target:.2f} ({abs(target-c):.1f}$) — "
+            f"{cfg['far']['wr']} הצלחה, {cfg['far']['per']} ש\"ח/עסקה\n"
+            f"⚡ קרוב: {near:.2f} ({TF_NEAR_TARGET_USD:.0f}$) — "
+            f"{cfg['near']['wr']} הצלחה, {cfg['near']['per']} ש\"ח/עסקה\n"
+            f"{'─' * 22}\n"
+            f"⚖️ <b>גודל פוזיציה</b>\n"
+            f"ירידה מצטברת גרועה (Monte Carlo): {cfg['worst_dd']:,} ש\"ח ב-1.5 אונקיות\n"
+            f"לחשבון {ACCOUNT_SIZE} ש\"ח: <b>{max_oz:.3f} אונקיות</b>\n"
+        )
+        if max_oz < 0.75:
+            msg += (f"🔴 מתחת למינימום של פלוס500 (0.75 אונקיה).\n"
+                    f"למסחר בפועל דרוש חשבון של ~{need_acct:,.0f} ש\"ח.\n")
+        msg += (
+            f"{'─' * 22}\n"
+            f"📈 בבדיקה (2.5 שנים):\n"
+            f"  🐢 {cfg['far']['trades']} עסק' | {cfg['far']['pnl']} ש\"ח | "
+            f"{cfg['far']['periods']} תקופות חיוביות\n"
+            f"  ⚡ {cfg['near']['trades']} עסק' | {cfg['near']['pnl']} ש\"ח\n"
+            f"⏳ החזקה: ימים, לא שעות (גם ביעד הקרוב).\n"
+            f"⚠️ מדגם דק. Forward test — בלי כסף, בלי לשנות פרמטרים.\n"
+            f"<i>מעקב בלבד — לא למסחר.</i>"
+        )
+        send_telegram(msg)
+        print(f"[TF-{name}] איתות: {direction} @{c:.2f} | סטופ {stop:.2f} | יעד {target:.2f}", flush=True)
+
+    if changed:
+        save_data(data)
+
+
 def slow_scan_and_monitor(data):
     """3.5.0: הלב החי של שיטה 2 — רץ בכל סריקה (10 דק').
 
@@ -3058,7 +3235,7 @@ def send_daily_report(data):
 # לולאה ראשית
 # ============================================================
 def main():
-    print("🤖 בוט מסחר מופעל! [גרסה 3.6.5 — יעד 10$ / סטופ 10$ | 1.5 אונקיות]", flush=True)
+    print("🤖 בוט מסחר מופעל! [גרסה 3.7.1 — שיטה 3 📊 (4H/6H, שתי תוכניות יציאה)]", flush=True)
     print(f"TOKEN exists: {bool(TELEGRAM_TOKEN)}", flush=True)
     print(f"CHAT_ID: {CHAT_ID}", flush=True)
     print(f"GIST configured: {gist_enabled()}", flush=True)
@@ -3076,7 +3253,7 @@ def main():
         storage_line = "⚠️ אחסון זמני בלבד (/tmp) — הגדר GIST_ID + GIST_TOKEN ב-Render"
 
     send_telegram(
-        "🤖 <b>בוט המסחר הופעל!</b> (גרסה 3.6.5)\n\n"
+        "🤖 <b>בוט המסחר הופעל!</b> (גרסה 3.7.1)\n\n"
         "🐢 <b>שיטה 2 — למסחר:</b> פריצת 20 ימים על נר 4 שעות,\n"
         "סטופ נגרר, בלי טארגט. איתות עם כפתורים = אמיתי.\n"
         "צפי: 1-2 איתותים בשבוע. שקט = תקין.\n\n"
@@ -3122,6 +3299,10 @@ def main():
                 if SLOW_LIVE:
                     try:
                         slow_scan_and_monitor(data)
+                        try:
+                            tf_scan(data)          # שיטה 3 — 4H + 6H, מעקב בלבד
+                        except Exception as _e:
+                            print(f"[TF] שגיאה: {_e}", flush=True)
                     except Exception as e:
                         print(f"[SLOW] שגיאה: {e}", flush=True)
 
