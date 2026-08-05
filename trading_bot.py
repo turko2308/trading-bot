@@ -2871,6 +2871,57 @@ def handle_callbacks(data, last_update_id):
                     send_telegram(f"⚠️ הבדיקה נכשלה: {e}")
                 continue
 
+            # 3.7.2: /reset — ניקוי נתוני שיטה 1 הישנים מהגיסט
+            if text.lower() in ("/reset", "reset", "ניקוי"):
+                try:
+                    _open2 = [t for t in data.get("trades", [])
+                              if t.get("system") == 2 and t.get("status") == "open"]
+                    _msg = ["🧹 <b>ניקוי גיסט — תצוגה מקדימה</b>\n",
+                            "<b>יימחק:</b>",
+                            f"  🚨 עסקאות שיטה 1: {len([t for t in data.get('trades', []) if t.get('system') != 2])}",
+                            f"  👥 רשומות shadow: {len(data.get('shadow_trades', []))}",
+                            f"  📅 ימי סטטיסטיקה: {len(data.get('daily_stats', {}))}",
+                            f"  ⏳ ממתינות: {len(data.get('pending', {}))}",
+                            "  📊 סטטיסטיקה מצטברת → מאופסת\n",
+                            "<b>יישמר:</b>",
+                            f"  🐢 עסקאות שיטה 2 פתוחות: {len(_open2)}",
+                            f"  🐢 shadow שיטה 2: {len(data.get('slow_shadow', []))}",
+                            f"  📊 איתותי שיטה 3: {len(data.get('tf_signals', []))}",
+                            "  🐢 מצב נרות שיטה 2 ו-3\n",
+                            "⚠️ פעולה בלתי הפיכה.",
+                            "לאישור שלח: <code>/reset confirm</code>"]
+                    send_telegram("\n".join(_msg))
+                except Exception as e:
+                    send_telegram(f"⚠️ שגיאה: {e}")
+                continue
+
+            if text.lower() in ("/reset confirm", "reset confirm"):
+                try:
+                    _kept = [t for t in data.get("trades", [])
+                             if t.get("system") == 2 and t.get("status") == "open"]
+                    _n_tr = len(data.get("trades", [])) - len(_kept)
+                    _n_sh = len(data.get("shadow_trades", []))
+                    data["trades"] = _kept
+                    data["shadow_trades"] = []
+                    data["daily_stats"] = {}
+                    data["signal_history"] = []
+                    data["pending"] = {}
+                    data["all_time_stats"] = {"total_trades": 0, "wins": 0, "losses": 0,
+                                              "total_pnl": 0, "early_exits": 0, "timeouts": 0}
+                    data.pop("shadow_last_signal", None)
+                    save_data(data)
+                    send_telegram(
+                        f"✅ <b>הגיסט נוקה</b>\n"
+                        f"נמחקו: {_n_tr} עסקאות, {_n_sh} רשומות shadow\n"
+                        f"נשמרו: {len(_kept)} עסקאות שיטה 2 פתוחות, "
+                        f"{len(data.get('slow_shadow', []))} shadow-2, "
+                        f"{len(data.get('tf_signals', []))} איתותי שיטה 3\n"
+                        f"📊 הסטטיסטיקה מתחילה מאפס.")
+                    print(f"[RESET] נוקו {_n_tr} עסקאות ו-{_n_sh} shadow", flush=True)
+                except Exception as e:
+                    send_telegram(f"⚠️ הניקוי נכשל: {e}")
+                continue
+
             # 3.6.0: /shadow2 — סיכום ה-shadow של שיטה 2
             if text.lower() in ("/shadow2", "shadow2", "צל2"):
                 try:
@@ -3235,7 +3286,7 @@ def send_daily_report(data):
 # לולאה ראשית
 # ============================================================
 def main():
-    print("🤖 בוט מסחר מופעל! [גרסה 3.7.1 — שיטה 3 📊 (4H/6H, שתי תוכניות יציאה)]", flush=True)
+    print("🤖 בוט מסחר מופעל! [גרסה 3.7.2 — שיטה 3 📊 + /reset לניקוי גיסט]", flush=True)
     print(f"TOKEN exists: {bool(TELEGRAM_TOKEN)}", flush=True)
     print(f"CHAT_ID: {CHAT_ID}", flush=True)
     print(f"GIST configured: {gist_enabled()}", flush=True)
@@ -3253,13 +3304,13 @@ def main():
         storage_line = "⚠️ אחסון זמני בלבד (/tmp) — הגדר GIST_ID + GIST_TOKEN ב-Render"
 
     send_telegram(
-        "🤖 <b>בוט המסחר הופעל!</b> (גרסה 3.7.1)\n\n"
+        "🤖 <b>בוט המסחר הופעל!</b> (גרסה 3.7.2)\n\n"
         "🐢 <b>שיטה 2 — למסחר:</b> פריצת 20 ימים על נר 4 שעות,\n"
         "סטופ נגרר, בלי טארגט. איתות עם כפתורים = אמיתי.\n"
         "צפי: 1-2 איתותים בשבוע. שקט = תקין.\n\n"
         "🚨 <b>המערכת הישנה — מעקב בלבד:</b> בלי כפתורים,\n"
         "לא למסחר. הסימולציה ממשיכה לרשום אותה.\n\n"
-        "💡 /backtest | /h1 | /h2 | /h3 | /h8 | /h9 | /shadow2 | /status | /mfe | /cross | /slow\n"
+        "💡 /backtest | /h1 | /h2 | /h3 | /h8 | /h9 | /shadow2 | /reset | /status | /mfe | /cross | /slow\n"
         f"{storage_line}"
     )
 
