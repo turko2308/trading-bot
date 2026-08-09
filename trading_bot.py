@@ -1697,6 +1697,16 @@ OLD_SIGNALS_WATCH_ONLY = True   # True = איתותי השיטה הישנה (�
 SLOW_ENTRY_DAYS = 20            # כניסה: פריצת שיא/שפל 20 ימי מסחר (הקומבינציה שניצחה ב-/slow: +474, 46%, שרדה 10 נק')
 SLOW_TRAIL_DAYS = 3             # יציאה: סטופ נגרר של 3 ימי מסחר
 SLOW_PENDING_HOURS = 4          # תוקף איתות עד הנר הבא
+# 3.8.0 — ברייקאיבן לשיטה 2 (נבדק 09/08 על xauusd_h4.csv, 2.5 שנים)
+#   אחרי שהמחיר זז SLOW_BE_TRIGGER$ לטובתנו, הסטופ מוקפץ לכניסה + OFFSET.
+#   הסטופ מתהדק בלבד — הברייקאיבן לא מרפה סטופ נגרר שכבר עבר אותו.
+#   התוצאה: הרווח כמעט זהה, הירידה נחתכת ב-~43%.
+#   בסיס: +632, MaxDD -161 | BE 25+3: +778, MaxDD -72
+#   MC (2,000): גרוע -316 → -171 | Bootstrap: P(רווח) 97.5% → 99.7%
+#   בהחלקה 10$ (פער הביצוע האמיתי): גרוע -361 → -225
+#   OFFSET=3 מכסה את הספרד — יציאה בברייקאיבן היא אפס, לא מינוס.
+SLOW_BE_TRIGGER = 25.0          # None = מכבה את הברייקאיבן לגמרי
+SLOW_BE_OFFSET = 3.0            # כמה מעל הכניסה מציבים את הסטופ
 CANDLES_PER_DAY_4H = 6          # זהב נסחר ~24 שעות → 6 נרות 4ש' ליום מסחר
 
 def _spread_points():
@@ -1706,7 +1716,8 @@ def _spread_points():
 
 def _simulate_slow(h4, entry_days=10, trail_days=5, risk_ils=SLOW_RISK_ILS,
                    slippage_points=0.0, fixed_target_points=None,
-                   pyramid_units=1, pyramid_step_n=0.5):
+                   pyramid_units=1, pyramid_step_n=0.5,
+                   be_trigger=None, be_offset=0.0):
     """עוקב מגמה איטי על נרות 4 שעות.
 
     entry_days: פריצת שיא/שפל של N ימי מסחר (N*6 נרות) פותחת עסקה.
@@ -1722,6 +1733,10 @@ def _simulate_slow(h4, entry_days=10, trail_days=5, risk_ils=SLOW_RISK_ILS,
                    ספקולציית תוך-נר. כל היחידות יוצאות יחד על הסטופ
                    הנגרר. שים לב: כל יחידה מסכנת risk_ils נוסף —
                    pyramid_units=4 מכפיל את הסיכון פי ~4.
+    be_trigger: ברייקאיבן — אחרי תנועה של X$ לטובתנו, הסטופ עולה
+                לכניסה + be_offset. None = כבוי (התנהגות הבסיס).
+                שמרני: הזרוע נדרכת בנר אחד ופועלת מהנר הבא, כי אי אפשר
+                לדעת את סדר האירועים בתוך נר.
     """
     ew = entry_days * CANDLES_PER_DAY_4H
     tw = trail_days * CANDLES_PER_DAY_4H
@@ -1769,6 +1784,7 @@ def _simulate_slow(h4, entry_days=10, trail_days=5, risk_ils=SLOW_RISK_ILS,
                        "stop_pts": stop_pts,
                        "units": [{"e": entry, "ipp": risk_ils / stop_pts}],
                        "last_add": entry, "n_atr": n_atr,
+                       "be_hit": False,
                        "et": c["t"]}
             continue
         # עדכון סטופ נגרר — מתהדק בלבד
@@ -1778,6 +1794,14 @@ def _simulate_slow(h4, entry_days=10, trail_days=5, risk_ils=SLOW_RISK_ILS,
             pos["trail"] = max(pos["trail"], t_lo)
         else:
             pos["trail"] = min(pos["trail"], t_hi)
+
+        # ברייקאיבן — הזרוע נדרכה בנר קודם; הסטופ מתהדק בלבד
+        if pos.get("be_hit"):
+            be_px = (pos["entry"] + be_offset) if pos["dir"] == "long" else (pos["entry"] - be_offset)
+            if pos["dir"] == "long":
+                pos["trail"] = max(pos["trail"], be_px)
+            else:
+                pos["trail"] = min(pos["trail"], be_px)
 
         # השערה 8: תוספות פירמידינג — רק על סגירת נר מעבר לטריגר
         if pyramid_units > 1 and pos.get("n_atr") and len(pos["units"]) < pyramid_units:
@@ -1815,6 +1839,13 @@ def _simulate_slow(h4, entry_days=10, trail_days=5, risk_ils=SLOW_RISK_ILS,
         if exit_px is not None:
             _close_pos(pos, exit_px, c["t"])
             pos = None
+            continue
+
+        # דריכת הברייקאיבן בסוף הנר — פועל מהנר הבא
+        if be_trigger is not None and not pos["be_hit"]:
+            mfe = (c["h"] - pos["entry"]) if pos["dir"] == "long" else (pos["entry"] - c["l"])
+            if mfe >= be_trigger:
+                pos["be_hit"] = True
     # פוזיציה שנותרה פתוחה בסוף הנתונים — נסגרת לפי המחיר האחרון (mark-to-market),
     # אחרת מגמה ארוכה שלא נשברה לא נספרת בכלל בדוח
     if pos is not None and h4:
@@ -2062,8 +2093,27 @@ def slow_scan_and_monitor(data):
 
     # --- ניטור עסקה פתוחה: חציית סטופ נגרר → סגירה אוטומטית ---
     if open_trade:
-        trail = open_trade["stop"]
         is_long = open_trade["direction"] == "קנייה"
+        # 3.8.0 — ברייקאיבן: אחרי תנועה של TRIGGER$ לטובתנו, הסטופ קופץ
+        # לכניסה + OFFSET. מתהדק בלבד; לא נוגע בסטופ נגרר שכבר עבר אותו.
+        if SLOW_BE_TRIGGER is not None and not open_trade.get("be_hit"):
+            _mfe = (current_price - open_trade["entry"]) if is_long else (open_trade["entry"] - current_price)
+            if _mfe >= SLOW_BE_TRIGGER:
+                _be = round(open_trade["entry"] + SLOW_BE_OFFSET, 2) if is_long else round(open_trade["entry"] - SLOW_BE_OFFSET, 2)
+                open_trade["be_hit"] = True
+                _improves = (is_long and _be > open_trade["stop"]) or ((not is_long) and _be < open_trade["stop"])
+                if _improves:
+                    _old = open_trade["stop"]
+                    open_trade["stop"] = _be
+                    send_telegram(
+                        f"🔒 <b>ברייקאיבן — עסקה {fmt_tn(open_trade['number'])}</b>\n"
+                        f"המחיר זז {_mfe:.1f}$ לטובתנו. הסטופ עלה לכניסה +{SLOW_BE_OFFSET:.0f}$.\n"
+                        f"סטופ חדש: <b>{open_trade['stop']}</b> (היה {round(_old, 2)})\n"
+                        f"מכאן העסקה לא יכולה להפסיד. (עדכן גם בפלוס500)"
+                    )
+                    print(f"[SLOW] ברייקאיבן: {_old} → {open_trade['stop']}", flush=True)
+                save_data(data)
+        trail = open_trade["stop"]
         crossed = (is_long and current_price <= trail) or ((not is_long) and current_price >= trail)
         if crossed:
             exit_px = trail
@@ -2180,6 +2230,7 @@ def slow_scan_and_monitor(data):
     data.setdefault("pending", {})[trade_id] = {
         "number": num, "symbol": symbol_name, "direction": direction,
         "entry": entry_px, "stop": trail0, "target1": None, "target2": None,
+        "be_hit": False,
         "stars": None, "system": 2, "ils_per_pt": round(ils_per_pt, 4),
         "time": now.isoformat()
     }
