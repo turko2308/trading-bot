@@ -1707,6 +1707,19 @@ SLOW_PENDING_HOURS = 4          # תוקף איתות עד הנר הבא
 #   OFFSET=3 מכסה את הספרד — יציאה בברייקאיבן היא אפס, לא מינוס.
 SLOW_BE_TRIGGER = 25.0          # None = מכבה את הברייקאיבן לגמרי
 SLOW_BE_OFFSET = 3.0            # כמה מעל הכניסה מציבים את הסטופ
+# 3.9.0 — פירמידינג לשיטה 2 (נבדק 10/08 על xauusd_h4.csv, 2.5 שנים,
+#   בגודל יחידה קבוע 0.75oz — מציאות פלוס500, לא גודל-לפי-סיכון):
+#   כניסה ראשונה 0.75oz. כשנר 4h נסגר 0.5×ATR14 מעבר לכניסה —
+#   התראה לפתוח פוזיציה שנייה של 0.75oz. שתיהן על אותו סטופ נגרר.
+#   תוצאות (יחידה בודדת ← 2 יחידות): ‏3,450+ ← ‏7,157+ | הצלחה 74% ← 45%
+#   MaxDD כמעט זהה: ‏657- ← ‏657- (התוספת נכנסת רק אחרי שהעסקה ברווח)
+#   עמידות: סליפג' 3$ ‏5,609+ | סליפג' 10$ ‏4,482+ (בסיס: ‏3,047+/‏2,395+)
+#   MC (2,000 ערבובים) גרוע: ‏1,016- ← ‏1,158-
+#   שקילות חשיפה: 2×0.75 מדורג = אותה חשיפה מקסימלית כמו 1.5 בכניסה
+#   אחת, אבל חצי MaxDD (‏657- מול ‏1,313-).
+SLOW_PYRAMID_UNITS = 2          # 1 = מכבה את הפירמידינג (התנהגות 3.8.0)
+SLOW_PYRAMID_STEP_N = 0.5       # הטריגר להוספה: 0.5×ATR14 מהכניסה
+SLOW_LOT_OZ = 0.75              # גודל יחידה בפועל בפלוס500 (המינימום)
 CANDLES_PER_DAY_4H = 6          # זהב נסחר ~24 שעות → 6 נרות 4ש' ליום מסחר
 
 def _spread_points():
@@ -2118,7 +2131,16 @@ def slow_scan_and_monitor(data):
         if crossed:
             exit_px = trail
             pts = (exit_px - open_trade["entry"]) if is_long else (open_trade["entry"] - exit_px)
-            pnl = (pts - spread_pts) * open_trade.get("ils_per_pt", points_to_ils(1))
+            _tunits = open_trade.get("units") or [{"e": open_trade["entry"]}]
+            if len(_tunits) > 1:
+                # 3.9.0: שתי יחידות — חישוב בשקלים אמיתיים (0.75oz ליחידה),
+                # לא בסקאלת הסיכון. כל יחידה משלמת ספרד משלה.
+                pnl = 0.0
+                for _u in _tunits:
+                    _pu = (exit_px - _u["e"]) if is_long else (_u["e"] - exit_px)
+                    pnl += (_pu - spread_pts) * SLOW_LOT_OZ * USD_ILS
+            else:
+                pnl = (pts - spread_pts) * open_trade.get("ils_per_pt", points_to_ils(1))
             result = "win" if pnl > 0 else "loss"
             _finalize_trade(data, open_trade, result, pnl)
             save_data(data)
@@ -2127,9 +2149,12 @@ def slow_scan_and_monitor(data):
             send_telegram(
                 f"{icon} <b>עסקה {fmt_tn(open_trade['number'])} — הסטופ הנגרר נחצה. נסגרה אוטומטית.</b>\n"
                 f"{symbol_name} | מחיר: {round(current_price, 2)} | יציאה: {round(exit_px, 2)}\n"
-                f"💰 {pnl:+.2f} ש\"ח | החזקה: "
+                f"💰 {pnl:+.2f} ש\"ח"
+                + (f" ({len(_tunits)} יחידות × {SLOW_LOT_OZ}oz)" if len(_tunits) > 1 else "")
+                + " | החזקה: "
                 f"{max(0, (now - datetime.datetime.fromisoformat(open_trade['entry_time']).replace(tzinfo=None)).days)} ימים\n"
-                f"(סגור גם בפלוס500 עכשיו — אשר קבלה 👇)",
+                + (f"(סגור את <b>שתי</b> הפוזיציות בפלוס500 עכשיו — אשר קבלה 👇)"
+                   if len(_tunits) > 1 else f"(סגור גם בפלוס500 עכשיו — אשר קבלה 👇)"),
                 keyboard
             )
             print(f"[SLOW] עסקה {open_trade['number']} נסגרה: {result} {pnl:+.1f}", flush=True)
@@ -2171,9 +2196,33 @@ def slow_scan_and_monitor(data):
                 print(f"[SLOW-SHADOW] נפתחה: {_d} @{_e} trail {_tr}", flush=True)
 
     if open_trade:
+        is_long = open_trade["direction"] == "קנייה"
+
+        # 3.9.0: פירמידינג — הוספת יחידה 2 על סגירת נר מעבר לטריגר.
+        # שמרני כמו בסימולציה: סגירת נר בלבד, לא תוך-נר. מחיר התוספת
+        # נרשם כמחיר הטריגר (כמו במנוע); הכניסה בפועל תהיה סביבו.
+        _units = open_trade.setdefault("units", [{"e": open_trade["entry"]}])
+        _atrg = open_trade.get("add_trigger")
+        if (SLOW_PYRAMID_UNITS > 1 and _atrg is not None
+                and len(_units) < SLOW_PYRAMID_UNITS):
+            _crossed_up = is_long and last_closed["c"] >= _atrg
+            _crossed_dn = (not is_long) and last_closed["c"] <= _atrg
+            if _crossed_up or _crossed_dn:
+                _units.append({"e": _atrg, "added_time": now.isoformat()})
+                open_trade["add_trigger"] = None   # יחידה אחת נוספת בלבד
+                save_data(data)
+                send_telegram(
+                    f"🪜 <b>פירמידינג — עסקה {fmt_tn(open_trade['number'])}</b>\n"
+                    f"נר 4 שעות נסגר {'מעל' if is_long else 'מתחת'} טריגר ההוספה ({_atrg}).\n"
+                    f"👉 <b>פתח עכשיו פוזיציה שנייה: {SLOW_LOT_OZ} אונקיה, "
+                    f"{'קנייה' if is_long else 'מכירה'}</b>\n"
+                    f"🛑 סטופ לפוזיציה החדשה: <b>{open_trade['stop']}</b> — זהה לראשונה.\n"
+                    f"מעכשיו כל עדכון סטופ חל על <b>שתי</b> הפוזיציות בפלוס500."
+                )
+                print(f"[SLOW] פירמידינג: יחידה 2 @{_atrg}", flush=True)
+
         # עדכון סטופ נגרר — מתהדק בלבד
         window = closed_candles[-tw:]
-        is_long = open_trade["direction"] == "קנייה"
         new_trail = min(x["l"] for x in window) if is_long else max(x["h"] for x in window)
         old_trail = open_trade["stop"]
         tightened = (is_long and new_trail > old_trail) or ((not is_long) and new_trail < old_trail)
@@ -2186,7 +2235,9 @@ def slow_scan_and_monitor(data):
                 f"סטופ חדש: <b>{open_trade['stop']}</b> (היה {round(old_trail, 2)})\n"
                 f"מחיר נוכחי: {round(current_price, 2)} | "
                 + (f"🔒 נעול רווח: {points_to_ils(locked) and ''}{locked:+.1f} נק'" if locked > 0 else f"מרחק מהכניסה: {locked:+.1f} נק'") + "\n"
-                f"(עדכן את הסטופ גם בפלוס500)"
+                + (f"(עדכן את הסטופ ב<b>שתי</b> הפוזיציות בפלוס500)"
+                   if len(open_trade.get("units") or []) > 1
+                   else f"(עדכן את הסטופ גם בפלוס500)")
             )
             print(f"[SLOW] trail {old_trail} → {open_trade['stop']}", flush=True)
         save_data(data)
@@ -2224,6 +2275,18 @@ def slow_scan_and_monitor(data):
     ils_per_pt = SLOW_RISK_ILS / stop_pts
     oz = ils_per_pt / USD_ILS
 
+    # 3.9.0: פירמידינג — ATR14 על 4h בזמן הכניסה קובע את טריגר ההוספה.
+    # עבר בלבד (נרות סגורים), כמו בסימולציה.
+    add_trigger = None
+    n_atr = None
+    if SLOW_PYRAMID_UNITS > 1 and len(closed_candles) >= 20:
+        _w = closed_candles[-30:]
+        n_atr = calc_atr([x["h"] for x in _w], [x["l"] for x in _w],
+                         [x["c"] for x in _w])
+        if n_atr:
+            _step = SLOW_PYRAMID_STEP_N * n_atr
+            add_trigger = round(entry_px + _step if is_long else entry_px - _step, 2)
+
     data["slow_seq"] = data.get("slow_seq", 0) + 1
     num = f"איטי #{data['slow_seq']}"
     trade_id = make_trade_id("SLOW", now.strftime("%d%H%M"))
@@ -2231,6 +2294,9 @@ def slow_scan_and_monitor(data):
         "number": num, "symbol": symbol_name, "direction": direction,
         "entry": entry_px, "stop": trail0, "target1": None, "target2": None,
         "be_hit": False,
+        "units": [{"e": entry_px}],          # 3.9.0: יחידות הפוזיציה (0.75oz כ"א)
+        "add_trigger": add_trigger,           # 3.9.0: מחיר ההוספה; None = אין
+        "n_atr": round(n_atr, 2) if n_atr else None,
         "stars": None, "system": 2, "ils_per_pt": round(ils_per_pt, 4),
         "time": now.isoformat()
     }
@@ -2244,13 +2310,16 @@ def slow_scan_and_monitor(data):
         f"{'מעל שיא' if is_long else 'מתחת שפל'} {SLOW_ENTRY_DAYS} ימים\n"
         f"━━━━━━━━━━━━━━━\n"
         f"📊 כיוון: <b>{direction} {'🟢' if is_long else '🔴'}</b>\n"
-        f"💰 כניסה: סביב <b>{entry_px}</b>\n"
+        f"💰 כניסה: סביב <b>{entry_px}</b> — יחידה 1: <b>{SLOW_LOT_OZ} אונקיה</b>\n"
         f"🛑 סטופ נגרר התחלתי: <b>{trail0}</b> ({stop_pts:.1f} נק')\n"
         f"🎯 טארגט: אין — יוצאים רק כשהסטופ הנגרר נחצה\n"
-        f"📏 גודל פוזיציה לסיכון {SLOW_RISK_ILS:.0f} ש\"ח: <b>{oz:.2f} אונקיות</b>\n"
+        + (f"🪜 טריגר להוספה (יחידה 2, {SLOW_LOT_OZ} אונקיה): נר 4ש' נסגר "
+           f"{'מעל' if is_long else 'מתחת'} <b>{add_trigger}</b> — תישלח התראה\n"
+           if add_trigger else "")
+        + f"📏 סקאלת דוח לסיכון {SLOW_RISK_ILS:.0f} ש\"ח: {oz:.2f} אונקיות\n"
         f"⏳ החזקה צפויה: ימים עד שבועות | תוקף האיתות: {SLOW_PENDING_HOURS} שעות\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"(בפלוס500 שלך הסכומים כפולים — התאם את הגודל)",
+        f"(פותחים {SLOW_LOT_OZ} אונקיה בפלוס500 — לא יותר. ההוספה רק בהתראה.)",
         keyboard
     )
     save_data(data)
@@ -3337,7 +3406,7 @@ def send_daily_report(data):
 # לולאה ראשית
 # ============================================================
 def main():
-    print("🤖 בוט מסחר מופעל! [גרסה 3.7.2 — שיטה 3 📊 + /reset לניקוי גיסט]", flush=True)
+    print("🤖 בוט מסחר מופעל! [גרסה 3.9.0 — פירמידינג שיטה 2 🪜]", flush=True)
     print(f"TOKEN exists: {bool(TELEGRAM_TOKEN)}", flush=True)
     print(f"CHAT_ID: {CHAT_ID}", flush=True)
     print(f"GIST configured: {gist_enabled()}", flush=True)
@@ -3355,7 +3424,7 @@ def main():
         storage_line = "⚠️ אחסון זמני בלבד (/tmp) — הגדר GIST_ID + GIST_TOKEN ב-Render"
 
     send_telegram(
-        "🤖 <b>בוט המסחר הופעל!</b> (גרסה 3.7.2)\n\n"
+        "🤖 <b>בוט המסחר הופעל!</b> (גרסה 3.9.0)\n\n"
         "🐢 <b>שיטה 2 — למסחר:</b> פריצת 20 ימים על נר 4 שעות,\n"
         "סטופ נגרר, בלי טארגט. איתות עם כפתורים = אמיתי.\n"
         "צפי: 1-2 איתותים בשבוע. שקט = תקין.\n\n"
