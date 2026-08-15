@@ -24,8 +24,8 @@ def now_il():
 # הגדרות
 # ============================================================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "960197631")
-TWELVEDATA_KEY = os.environ.get("TWELVE_DATA_API_KEY", "2be6ffca08d942de8903d6aee41a312e")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+TWELVEDATA_KEY = os.environ.get("TWELVE_DATA_API_KEY", "")
 
 # ===== אחסון קבוע: GitHub Gist =====
 # GIST_ID + GIST_TOKEN מוגדרים ב-Render Environment.
@@ -109,13 +109,58 @@ DAILY_STATS_KEEP_DAYS = 90
 # האמיתי כפול ממה שהבוט מציג. עדכן POSITION_SIZE_OZ בהתאם.
 # ============================================================
 POSITION_SIZE_OZ = 1.5   # 3.6.5: תוקן — איזק סוחר 1.5 אונקיות
-USD_ILS = 2.99
+# 3.9.3: השער נמדד מ-**רווח/הפסד שנסגר**, לא משווי פוזיציה מוצג.
+# מסך Closed Position, פוזיציה 1879518625:
+#   1.5oz · 4200.13 → 4390.74 · שווי 6,300.20$ → 6,586.11$ (הפרש 285.91$)
+#   P&L ‏858.14 ש"ח  →  858.14 / 285.91 = 3.0014
+# ‏3.9.2 השתמש ב-2.9617, שנגזר מ**שווי פוזיציה** מוצג. אלה שתי המרות
+# שונות בפלוס500. מה שקובע לדיווח רווח/הפסד הוא זו של ה-P&L.
+USD_ILS = 3.0014
 SPREAD_POINTS = 0.77
+
+# ── 3.9.1: מימון לילה — **נמדד**, לא משוער ──────────────────────
+# מקור: עסקה אמיתית שנסגרה בפלוס500 — 1.5 אונקיות, 08/05/26 16:32 →
+# 10/08/26 22:55 (5.27 ימים), Overnight Funding ‏30.16- ש"ח.
+#     30.16 / 1.5 / 5.27 = 3.82 ש"ח ליום לאונקיה
+# ההנחה הקודמת בתיעוד הייתה 6.00 ש"ח ליום ל-0.75 אונקיה — גבוהה פי 2.1.
+# ‏3.9.3: השער שנגזר מאותה עסקה (3.0014) אומץ כ-USD_ILS. ר' למעלה.
+# ‏אימות: 30.16 / 1.5 / 5.27 = 3.82 — מאושר שוב מול המסך ב-15/08.
+FUNDING_ILS_PER_OZ_DAY = 3.82
+FUNDING_ILS_PER_DAY_MIN_LOT = round(FUNDING_ILS_PER_OZ_DAY * 0.75, 2)   # 2.86
+
+def funding_cost_ils(oz, days):
+    """עלות מימון לילה מצטברת. חיובי = עלות."""
+    return FUNDING_ILS_PER_OZ_DAY * oz * max(0.0, days)
 
 def points_to_ils(points):
     return POSITION_SIZE_OZ * abs(points) * USD_ILS
 
 SPREAD_COST_ILS = round(POSITION_SIZE_OZ * SPREAD_POINTS * USD_ILS, 2)
+
+# ── 3.9.1: סימון אחיד להודעות טלגרם ────────────────────────────
+# ריבוע צבעוני לפי שיטה + גבול ברור לתחילת וסוף איתות, כדי שאפשר יהיה
+# להבחין בין שיטות ובין איתות להודעת שירות במבט אחד בפיד.
+METHOD_MARK = {1: "🟥", 2: "🟩", 3: "🟧"}
+METHOD_NAME = {1: "שיטה 1", 2: "שיטה 2", 3: "שיטה 3"}
+
+def sig_open(system):
+    m = METHOD_MARK.get(system, "⬜")
+    return f"{m * 6}\n<b>▼ תחילת איתות · {METHOD_NAME.get(system, '')}</b>"
+
+def sig_close(system):
+    m = METHOD_MARK.get(system, "⬜")
+    return f"<b>▲ סוף איתות · {METHOD_NAME.get(system, '')}</b>\n{m * 6}"
+
+TF_SIGNAL_OPEN = sig_open(3)
+TF_SIGNAL_CLOSE = sig_close(3)
+
+# ── 3.9.3: חותמת גרסה על כל רשומה שנשמרת ──────────────────────
+# הצורך: מ-3.9.2 השדה `pnl` מודד דבר אחר לגמרי (0.75oz נטו במקום
+# סקאלת סיכון 40 ש"ח). רשומה ישנה וחדשה נראות זהות ואי אפשר להבדיל
+# ביניהן בדיעבד. הכלל "אל תערבב נתונים משתי סקאלות" תוחזק עד היום
+# לפי תאריך בלבד — עכשיו הוא נאכף בנתונים עצמם.
+BOT_VERSION = "3.9.3"
+PNL_SCALE = "0.75oz-net"        # מה שהשדה pnl מודד בגרסה הזו
 
 DATA_FILE = "/tmp/bot_data.json"
 
@@ -298,6 +343,10 @@ def prune_data(data):
 def save_data(data):
     """כותב ל-/tmp (גיבוי מקומי) ודוחף ל-Gist (אחסון קבוע)."""
     prune_data(data)
+    # 3.9.3: חותמת גרסה — מי כתב את הרשומות ובאיזו סקאלה.
+    data["_bot_version"] = BOT_VERSION
+    data["_pnl_scale"] = PNL_SCALE
+    data["_saved_at"] = now_il().isoformat()
     try:
         with open(DATA_FILE, "w") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -976,6 +1025,7 @@ def analyze_and_signal(symbol_name, symbol_code, data):
     )
 
     msg = (
+        f"{sig_open(1)}\n"
         f"🚨 <b>איתות סחר {trade_num} — {symbol_name}</b>\n"
         f"🕐 {now.strftime('%H:%M')} | {star_display} {stars}/5\n"
         f"{reversal_warning}"
@@ -996,15 +1046,21 @@ def analyze_and_signal(symbol_name, symbol_code, data):
         # 3.5.0: הישנה נפסלה למסחר (מבחן עמידות 16/07) — נשארת כעיניים בלבד.
         # אין כפתורים ואין pending: אין דרך "להיכנס" עליה בטעות.
         pending.pop(trade_id, None)
-        msg = msg.replace("🚨 <b>איתות סחר", "🚨 <b>[מעקב בלבד] איתות ישן")
-        msg += "\n📊 <i>המערכת הישנה — לא למסחר. הסימולציה עוקבת.</i>"
-        send_telegram(msg)
+        # 3.9.3: מצב שקט — הכל נרשם, כלום לא נשלח.
+        if OLD_SIGNALS_SILENT:
+            print(f"[S1-SILENT] {trade_num} {direction} @{entry_price} "
+                  f"({stars}/5) — נרשם, לא נשלח", flush=True)
+        else:
+            msg = msg.replace("🚨 <b>איתות סחר", "🚨 <b>[מעקב בלבד] איתות ישן")
+            msg += ("\n📊 <i>המערכת הישנה — לא למסחר. הסימולציה עוקבת.</i>"
+                    f"\n{sig_close(1)}")
+            send_telegram(msg)
     else:
         keyboard = [[
             {"text": "✅ נכנסתי", "callback_data": f"en_{trade_id}"},
             {"text": "❌ דילגתי", "callback_data": f"sk_{trade_id}"}
         ]]
-        send_telegram(msg, keyboard)
+        send_telegram(msg + f"\n{sig_close(1)}", keyboard)
 
     data["signal_history"].append({
         "symbol": symbol_name,
@@ -1690,12 +1746,48 @@ def run_h3_backtest():
 # סיכון קבוע בש"ח לעסקה — גודל הפוזיציה נגזר מרוחב הסטופ.
 # סימולציה וקריאה בלבד — הלוגיקה החיה לא נגעה.
 # ============================================================
-SLOW_RISK_ILS = 40.0            # סיכון התחלתי לעסקה בש"ח (סקאלת הבוט)
+SLOW_RISK_ILS = 40.0            # סיכון לעסקה — **לבדיקות היסטוריות בלבד**
+# ══════════════════════════════════════════════════════════════
+# 3.9.2 — הדיווח עבר מסקאלת סיכון לגודל אמיתי
+# ══════════════════════════════════════════════════════════════
+# עד 3.9.1 כל דיווח בשקלים חושב לפי SLOW_RISK_ILS=40: הגודל התאים
+# את עצמו לרוחב הסטופ כך שהסיכון תמיד 40 ש"ח. זו סקאלה תיאורטית —
+# בפלוס500 אי אפשר לפתוח 0.28 אונקיה. המינימום הוא 0.75, נקודה.
+#
+# מה זה עשה בפועל: עסקה איטי #1 (13/08) דווחה כ-**41.20+ ש"ח**.
+# בגודל האמיתי, עם ספרד ומימון של 8 ימים, היא הייתה **11.28- ש"ח**.
+# הבוט הראה רווח על עסקה מפסידה.
+#
+# מ-3.9.2: כל שקל שהבוט מציג הוא 0.75 אונקיה בפועל, בניכוי ספרד
+# ומימון. אין יותר שתי סקאלות.
+REPORT_LOT_OZ = 0.75            # הגודל שבו מדווח הכל. = SLOW_LOT_OZ
+
+def ils_per_point(oz=None):
+    """שקלים לכל דולר תזוזה, בגודל אמיתי."""
+    return (REPORT_LOT_OZ if oz is None else oz) * USD_ILS
+
+# 3.9.3: ‏real_pnl() הוסרה — היא הוגדרה ב-3.9.2 ומעולם לא נקראה
+# (מסלול הסגירה שכפל אותה inline), ושמה התנגש עם משתנה מקומי ב-/status.
+# מחליפה אותה slow_real_pnl() ליד _finalize_trade, שגם סופרת יחידות,
+# ימי החזקה ומימון, ויודעת מתי לא לגבות ספרד.
+
 # ===== 3.5.0: מצב כפול — שיטה 2 למסחר, הישנה למעקב-בלבד =====
 SLOW_LIVE = True                # True = איתותי שיטה 2 (🐢) פעילים עם כפתורים
 OLD_SIGNALS_WATCH_ONLY = True   # True = איתותי השיטה הישנה (🚨) נשלחים בלי כפתורים, "מעקב בלבד"; הצללים ממשיכים
+# ── 3.9.3: שיטה 1 רצה בשקט ─────────────────────────────────────
+# ‏True = איתותי שיטה 1 **לא נשלחים לטלגרם בכלל**. כל השאר ממשיך בדיוק
+# כמו קודם: הצללים נפתחים ונסגרים, shadow_trades/daily_stats מתעדכנים,
+# signal_history נרשם, והדוח היומי ממשיך להציג את שיטה 1.
+# הנימוק: לפי הגיסט — 18-19 איתותים ביום, 77 צללים ב-9 ימים, 42.9%
+# הצלחה, ‏759- ש"ח. שיטה 1 רדומה ואין השערות פתוחות (STATUS §9.7);
+# ההודעות הן רעש שמסתיר את שיטות 2 ו-3.
+# ‏False מחזיר את ההודעות בלי שום שינוי אחר.
+OLD_SIGNALS_SILENT = True
 SLOW_ENTRY_DAYS = 20            # כניסה: פריצת שיא/שפל 20 ימי מסחר (הקומבינציה שניצחה ב-/slow: +474, 46%, שרדה 10 נק')
-SLOW_TRAIL_DAYS = 3             # יציאה: סטופ נגרר של 3 ימי מסחר
+SLOW_TRAIL_DAYS = 4             # 3.9.1: 3 → 4. אושר בעבר ולא היה פרוס.
+                                # הנימוק הוא עמידות, לא רווח נקי: ב-0$ ההפרש
+                                # קטן (1796 מול 1578), אבל בהחלקה 10$ זה
+                                # 1230 מול 748, ו-MaxDD ‏109- מול ‏139-.
 SLOW_PENDING_HOURS = 4          # תוקף איתות עד הנר הבא
 # 3.8.0 — ברייקאיבן לשיטה 2 (נבדק 09/08 על xauusd_h4.csv, 2.5 שנים)
 #   אחרי שהמחיר זז SLOW_BE_TRIGGER$ לטובתנו, הסטופ מוקפץ לכניסה + OFFSET.
@@ -1908,17 +2000,29 @@ def _simulate_slow(h4, entry_days=10, trail_days=5, risk_ils=SLOW_RISK_ILS,
 # בודדת, כי מה שמוחק חשבון הוא רצף הפסדים ולא עסקה אחת.
 # כל מסגרת מציגה שתי תוכניות יציאה על אותה כניסה ואותו סטופ:
 #   far  = יעד 2×ATR — הכי רווחי (‏71 ש"ח/עסקה ב-6H), אבל ימים והרבה הפסדים
-#   near = יעד 10$ קבוע — 87% הצלחה ב-6H, יציאה מהירה, ‏9.65 ש"ח/עסקה
-# שתיהן נבדקו על אותם 2.5 שנים. הסטופ זהה — רק היעד משתנה.
+#   near = יעד 10$ קבוע — הושבת ב-3.9.1, ר' למטה.
+# 3.9.1: מספרי ה-far להלן **לא שוחזרו** ע"י tools/tf_engine.py. השחזור
+# על אותם נתונים נותן 4H ‏4,485+ ו-6H ‏7,194+ (מנוע עסקה-אחת), ובטווח
+# היישורים 4,485–7,345 ו-6,014–9,862. המספר של 4H נמצא בתוך הטווח;
+# זה של 6H (11,720) מעליו. הם נשארים כאן כתיעוד היסטורי בלבד ומסומנים
+# ככאלה בהודעה — לא ככיול. אין לכייל את המנוע אליהם.
 TF_CONFIGS = [
     {"name": "4H", "hours": 4, "worst_dd": 8106, "med_dd": 3485,
-     "far": {"trades": 247, "wr": "55%", "pnl": "+6,167", "per": "+24.97", "periods": "4/5"},
-     "near": {"trades": 440, "wr": "82%", "pnl": "+639", "per": "+1.45"}},
+     "far": {"trades": 247, "wr": "55%", "pnl": "+6,167", "per": "+24.97", "periods": "4/5"}},
     {"name": "6H", "hours": 6, "worst_dd": 6009, "med_dd": 2172,
-     "far": {"trades": 164, "wr": "62%", "pnl": "+11,720", "per": "+71.47", "periods": "5/5"},
-     "near": {"trades": 326, "wr": "87%", "pnl": "+3,145", "per": "+9.65"}},
+     "far": {"trades": 164, "wr": "62%", "pnl": "+11,720", "per": "+71.47", "periods": "5/5"}},
 ]
-TF_NEAR_TARGET_USD = 10.0   # יעד קרוב קבוע
+# ── 3.9.1: היעד הקרוב הושבת ────────────────────────────────────
+# יעד קבוע של 10$ מול סטופ שגדל עם ה-ATR (היום ~59$) = סיכון 59 כדי
+# להרוויח 10. הבדיקה מחדש (tools/tf_engine.py):
+#     יעד 10$ →  4H: ‏3-   | 6H: ‏776-
+#     יעד 20$ →  4H: 1,772 | 6H: 604
+#     יעד 50$ →  4H: 2,699 | 6H: 2,110
+# והוא **נשבר עם הזמן** ככל שה-ATR גדל: 2024 ‏79-‏ / 2025 ‏217-‏ / 2026 ‏481-‏,
+# למרות שאחוז ההצלחה עלה ל-89%. עד 3.9.0 הוא הוצג באיתות כאילו הוא
+# אופציה תקפה. הוא לא. None = לא מוצג. אין לשחזר ערך קבוע בדולרים —
+# אם יוחזר יעד קרוב, הוא חייב להיות ביחס ל-ATR.
+TF_NEAR_TARGET_USD = None
 TF_DD_BASE_OZ = 1.5        # גודל הפוזיציה שבו נמדדו הירידות
 TF_DD_BUDGET = 0.30        # אחוז מהחשבון שמותר לירידה הגרועה לצרוך
 TF_BREAKOUT_BARS = 20      # פריצת שיא/שפל של 20 נרות
@@ -1926,6 +2030,18 @@ TF_EMA_PERIOD = 50         # מסנן מגמה
 TF_ATR_PERIOD = 14
 TF_STOP_ATR = 2.0          # סטופ = 2×ATR
 TF_TARGET_ATR = 2.0        # יעד = 2×ATR
+
+# 3.9.3: ‏TF_RISK_ILS ו-PLUS500_MIN_OZ הוסרו. הם נוספו ב-3.9.1 עבור
+# "גודל לפי סיכון לשיטה 3", אבל 3.9.2 החליט על גודל קבוע (REPORT_LOT_OZ)
+# והם נשארו קוד מת. ‏STATUS עדיין מונה את תיקון #5 של 3.9.1 — הוא בוטל.
+
+# 3.9.1: חלון הגיבוי בין המסגרות (הממצא החזק בשיטה 3).
+# איתות 4H בלי איתות 6H מקביל הוא קבוצה מפסידה שיטתית. נרות 4H נסגרים
+# ב-00/04/08/12/16/20 ונרות 6H ב-00/06/12/18 → הפער המרבי 4 שעות, ולכן
+# גיבוי יכול להגיע עד 4 שעות **אחרי** האיתות. אין כאן סינון אוטומטי —
+# רק סימון באיתות, כי שיטה 3 היא מעקב בלבד.
+TF_BACKUP_WINDOW_H = 4     # עד כמה שעות אחרי האיתות מקבלים גיבוי
+TF_BACKUP_LOOKBACK_H = 6   # וכמה אחורה נחשב "גיבוי קיים" (נר 6H אחד)
 
 
 def _tf_aggregate(h1_bars, hours):
@@ -1959,12 +2075,110 @@ def _tf_atr(bars, n=TF_ATR_PERIOD):
     return sum(tr) / n
 
 
+def tf_monitor(data, h1):
+    """3.9.3: סוגר איתותי שיטה 3 — הפונקציה הזו פשוט לא הייתה קיימת.
+
+    עד 3.9.2 כל רשומה ב-tf_signals נכתבה עם status="open" ושום קוד
+    לא סגר אותה. הגיסט מ-15/08 מראה 10 מתוך 10 תקועות כ-open, בלי
+    תוצאה אחת. המשמעות: ה-forward test — שהוא לפי STATUS §9.5
+    "העדיפות הסטטיסטית העליונה" — צבר כניסות ואפס תצפיות.
+
+    הלוגיקה זהה לזו של tools/tf_engine.py במצב "נר פסימי": אם נר
+    בודד נגע גם בסטופ וגם ביעד, הסטופ מנצח. כך שמספרי ה-forward test
+    יהיו בני-השוואה למספרי הבדיקה ההיסטורית ולא נדיבים מהם.
+
+    מעקב בלבד — הרווח מדווח ב-REPORT_LOT_OZ כדי שיהיה באותה סקאלה
+    כמו שיטה 2, אבל אין פוזיציה אמיתית ואין מימון (עסקאות שיטה 3
+    נסגרות בימים בודדים והן לא נפתחו בפלוס500).
+    """
+    log = data.get("tf_signals", [])
+    open_sigs = [x for x in log if x.get("status") == "open"]
+    if not open_sigs or not h1:
+        return False
+
+    changed = False
+    for sig in open_sigs:
+        try:
+            t0 = datetime.datetime.fromisoformat(sig["candle"])
+        except (KeyError, ValueError, TypeError):
+            sig["status"] = "void"
+            sig["result"] = "bad_record"
+            changed = True
+            continue
+
+        entry = sig["entry"]
+        stop = sig["stop"]
+        target = sig["target"]
+        is_long = sig.get("direction") == "קנייה"
+
+        # רק נרות שנסגרו אחרי נר האיתות
+        bars = [b for b in h1 if b["t"] > t0]
+        if not bars:
+            continue
+        # 3.9.3: ההיסטוריה מוגבלת ל-800 נרות שעתיים (~33 יום). רשומה
+        # ישנה מזה לא ניתנת להכרעה — מסמנים במקום להשאיר "open" לנצח.
+        if t0 < h1[0]["t"]:
+            sig["status"] = "unresolved"
+            sig["result"] = "out_of_history"
+            changed = True
+            continue
+
+        hit = None
+        exit_px = None
+        exit_t = None
+        for b in bars:
+            s_hit = (b["l"] <= stop) if is_long else (b["h"] >= stop)
+            t_hit = (b["h"] >= target) if is_long else (b["l"] <= target)
+            if s_hit:                      # נר פסימי: הסטופ קודם
+                hit, exit_px, exit_t = "loss", stop, b["t"]
+                break
+            if t_hit:
+                hit, exit_px, exit_t = "win", target, b["t"]
+                break
+        if not hit:
+            continue
+
+        pts = (exit_px - entry) if is_long else (entry - exit_px)
+        pnl = round((pts - SPREAD_POINTS) * REPORT_LOT_OZ * USD_ILS, 2)
+        sig["status"] = "closed"
+        sig["result"] = hit
+        sig["exit"] = round(exit_px, 2)
+        sig["pnl"] = pnl
+        sig["points"] = round(pts, 2)
+        sig["close_time"] = exit_t.isoformat()
+        sig["bars_held"] = sum(1 for b in bars if b["t"] <= exit_t)
+        changed = True
+
+        icon = "🎯" if hit == "win" else "🛑"
+        send_telegram(
+            f"{METHOD_MARK[3]} <b>[מעקב] שיטה 3 — {sig.get('tf')} נסגרה</b> {icon}\n"
+            f"{sig.get('direction')} {entry} → {sig['exit']} ({pts:+.1f}$)\n"
+            f"💰 {pnl:+.2f} ש\"ח ({REPORT_LOT_OZ}oz תיאורטי)\n"
+            f"⏳ {sig['bars_held']} שעות"
+            + (" | ✅ היה גיבוי 6H" if sig.get("backup") is True else "")
+            + (" | ⚠️ בלי גיבוי 6H" if sig.get("backup") is False else "")
+        )
+        print(f"[TF-{sig.get('tf')}] נסגרה: {hit} {pnl:+.2f}", flush=True)
+
+    # סיכום מצטבר — הדבר שה-forward test קיים בשבילו
+    closed = [x for x in log if x.get("status") == "closed"]
+    if changed and len(closed) >= 5:
+        w = sum(1 for x in closed if x["result"] == "win")
+        tot = round(sum(x.get("pnl", 0) for x in closed), 2)
+        print(f"[TF] מצטבר: {len(closed)} עסק' | {100*w/len(closed):.0f}% | "
+              f"{tot:+.2f} ש\"ח", flush=True)
+    return changed
+
+
 def tf_scan(data):
     """סורק 4H ו-6H. מעקב בלבד — בלי כפתורים, בלי כסף."""
     symbol = list(SYMBOLS.values())[0]
     h1 = _fetch_history(symbol, "1h", 800)
     if not h1 or len(h1) < 400:
         return
+
+    # 3.9.3: קודם סוגרים מה שפתוח, אחר כך מחפשים חדש.
+    tf_closed_any = tf_monitor(data, h1)
 
     now = now_il().replace(tzinfo=None)
     state = data.setdefault("tf_state", {})
@@ -2006,56 +2220,120 @@ def tf_scan(data):
         is_long = direction == "קנייה"
         stop = c - TF_STOP_ATR * atr if is_long else c + TF_STOP_ATR * atr
         target = c + TF_TARGET_ATR * atr if is_long else c - TF_TARGET_ATR * atr
-        near = c + TF_NEAR_TARGET_USD if is_long else c - TF_NEAR_TARGET_USD
         risk_usd = abs(c - stop)
-        # גודל פוזיציה לפי הירידה המצטברת הגרועה, לא לפי עסקה בודדת
-        max_oz = TF_DD_BASE_OZ * (ACCOUNT_SIZE * TF_DD_BUDGET) / cfg["worst_dd"]
-        need_acct = cfg["worst_dd"] * 0.75 / TF_DD_BASE_OZ / TF_DD_BUDGET
+
+        # 3.9.1: גודל לפי סיכון לעסקה — לא לפי הירידה המצרפית.
+        # הנוסחה הישנה (TF_DD_BASE_OZ * ACCOUNT_SIZE * TF_DD_BUDGET / worst_dd)
+        # החזירה ~0.03 אונקיה תמיד, בלי קשר לגודל הסטופ — כלומר בפועל
+        # גודל קבוע. הבעיה שהיא הסתירה: ה-ATR של הזהב שולש (2024: 14.2 →
+        # 2026: 50.7), ולכן סיכון קבוע-בגודל הוא סיכון-שמשולש-בשקלים.
+        max_oz = REPORT_LOT_OZ   # 3.9.2: גודל קבוע — המינימום בפלוס500
+        # הסיכון האמיתי אם בכל זאת פותחים את המינימום של פלוס500:
+        risk_at_min_ils = (risk_usd + SPREAD_POINTS) * REPORT_LOT_OZ * USD_ILS
+
+        # 3.9.1: גיבוי בין-מסגרתי. איתות 4H בלי איתות 6H מקביל באותו
+        # כיוון הוא קבוצה מפסידה שיטתית (37% הצלחה, ‏2,094- ש"ח על 71
+        # עסקאות). הבדיקה מסתכלת רק אחורה — הגיבוי שמגיע עד 4 שעות אחרי
+        # נבדק בסריקה הבאה ונשלח כעדכון נפרד. אין הצצה לעתיד.
+        other = "6H" if name == "4H" else "4H"
+        backup = None
+        if name == "4H":
+            cutoff = now_il() - datetime.timedelta(hours=TF_BACKUP_LOOKBACK_H)
+            for s in reversed(log[-40:]):
+                if s.get("tf") != other or s.get("direction") != direction:
+                    continue
+                try:
+                    st = datetime.datetime.fromisoformat(s["time"])
+                except (ValueError, KeyError):
+                    continue
+                if st >= cutoff:
+                    backup = s
+                    break
 
         log.append({
             "tf": name, "direction": direction, "entry": round(c, 2),
             "stop": round(stop, 2), "target": round(target, 2),
-            "target_near": round(near, 2),
-            "atr": round(atr, 2), "candle": key,
+            "atr": round(atr, 2), "candle": key, "risk_usd": round(risk_usd, 2),
+            "max_oz": round(max_oz, 3),
+            "risk_at_min_ils": round(risk_at_min_ils, 1),
+            "backup": bool(backup) if name == "4H" else None,
             "time": now_il().isoformat(), "status": "open"
         })
 
+        # אם זה איתות 6H — יש איתות 4H מהשעות האחרונות שחיכה לגיבוי?
+        if name == "6H":
+            since = now_il() - datetime.timedelta(hours=TF_BACKUP_WINDOW_H)
+            for s in reversed(log[-40:]):
+                if (s.get("tf") == "4H" and s.get("direction") == direction
+                        and s.get("backup") is False):
+                    try:
+                        st = datetime.datetime.fromisoformat(s["time"])
+                    except (ValueError, KeyError):
+                        continue
+                    if st >= since:
+                        s["backup"] = True
+                        s["backup_late_h"] = round(
+                            (now_il() - st).total_seconds() / 3600.0, 1)
+                        send_telegram(
+                            f"🟧 <b>[שיטה 3] גיבוי 6H הגיע</b>\n"
+                            f"האיתות של 4H מ-{st.strftime('%d/%m %H:%M')} "
+                            f"({s['direction']} @{s['entry']}) קיבל גיבוי 6H "
+                            f"באותו כיוון אחרי {s['backup_late_h']} שעות.\n"
+                            f"הוא עובר מקבוצת <b>37%</b> לקבוצת <b>62%</b>."
+                        )
+                        break
+
+        # 3.9.1: סימון גיבוי 6H — הדבר הראשון שרואים באיתות 4H.
+        backup_line = ""
+        if name == "4H":
+            if backup:
+                backup_line = (
+                    f"✅ <b>יש גיבוי 6H</b> באותו כיוון "
+                    f"(מ-{backup['time'][11:16]}) — קבוצת <b>62%</b> הצלחה, "
+                    f"‏24.3+ ש\"ח לעסקה.\n")
+            else:
+                backup_line = (
+                    f"⚠️ <b>אין גיבוי 6H — קבוצת 37% הצלחה.</b>\n"
+                    f"‏71 עסקאות כאלה ב-2.5 שנים: ‏2,094- ש\"ח, "
+                    f"‏29.5- לעסקה, שליליות בכל שלוש השנים (p=0.02-0.003).\n"
+                    f"גיבוי עוד יכול להגיע עד {TF_BACKUP_WINDOW_H} שעות — "
+                    f"תישלח התראה אם כן.\n")
+
         msg = (
-            f"📊 <b>[מעקב בלבד] שיטה 3 — מסגרת {name}</b>\n"
+            f"{TF_SIGNAL_OPEN}\n"
+            f"{METHOD_MARK[3]} <b>[מעקב בלבד] שיטה 3 — מסגרת {name}</b>\n"
             f"🕐 {now_il().strftime('%d/%m %H:%M')} | נר {name} שנסגר\n"
             f"{'─' * 22}\n"
+            f"{backup_line}"
             f"📊 כיוון: <b>{direction}</b>\n"
             f"💰 כניסה: {c:.2f}\n"
-            f"🛑 סטופ: {stop:.2f}  ({risk_usd:.1f}$)  — זהה לשתי התוכניות\n"
+            f"🛑 סטופ: {stop:.2f}  ({risk_usd:.1f}$)\n"
+            f"🎯 יעד: {target:.2f} ({abs(target-c):.1f}$ = 2×ATR)\n"
             f"📏 ATR({TF_ATR_PERIOD}) = {atr:.2f}$\n"
             f"{'─' * 22}\n"
-            f"🎯 <b>שתי תוכניות יציאה</b>\n"
-            f"🐢 רחוק: {target:.2f} ({abs(target-c):.1f}$) — "
-            f"{cfg['far']['wr']} הצלחה, {cfg['far']['per']} ש\"ח/עסקה\n"
-            f"⚡ קרוב: {near:.2f} ({TF_NEAR_TARGET_USD:.0f}$) — "
-            f"{cfg['near']['wr']} הצלחה, {cfg['near']['per']} ש\"ח/עסקה\n"
-            f"{'─' * 22}\n"
-            f"⚖️ <b>גודל פוזיציה</b>\n"
-            f"ירידה מצטברת גרועה (Monte Carlo): {cfg['worst_dd']:,} ש\"ח ב-1.5 אונקיות\n"
-            f"לחשבון {ACCOUNT_SIZE} ש\"ח: <b>{max_oz:.3f} אונקיות</b>\n"
+            f"⚖️ <b>גודל וסיכון — שקלים אמיתיים</b>\n"
+            f"גודל: <b>{REPORT_LOT_OZ} אונקיה</b> (המינימום בפלוס500)\n"
+            f"🔴 <b>הסיכון האמיתי: {risk_at_min_ils:.0f} ש\"ח</b> "
+            f"({100*risk_at_min_ils/ACCOUNT_SIZE:.0f}% מחשבון של {ACCOUNT_SIZE})\n"
         )
-        if max_oz < 0.75:
-            msg += (f"🔴 מתחת למינימום של פלוס500 (0.75 אונקיה).\n"
-                    f"למסחר בפועל דרוש חשבון של ~{need_acct:,.0f} ש\"ח.\n")
+        if risk_at_min_ils > ACCOUNT_SIZE * 0.05:
+            msg += (f"⚠️ מעל 5% מהחשבון בעסקה אחת. "
+                    f"לסיכון סביר דרוש ~{risk_at_min_ils/0.05:,.0f} ש\"ח.\n")
         msg += (
             f"{'─' * 22}\n"
-            f"📈 בבדיקה (2.5 שנים):\n"
-            f"  🐢 {cfg['far']['trades']} עסק' | {cfg['far']['pnl']} ש\"ח | "
-            f"{cfg['far']['periods']} תקופות חיוביות\n"
-            f"  ⚡ {cfg['near']['trades']} עסק' | {cfg['near']['pnl']} ש\"ח\n"
-            f"⏳ החזקה: ימים, לא שעות (גם ביעד הקרוב).\n"
+            f"📈 בבדיקה (2.5 שנים): {cfg['far']['trades']} עסק' | "
+            f"{cfg['far']['pnl']} ש\"ח | {cfg['far']['periods']} תקופות חיוביות\n"
+            f"⏳ החזקה: ימים, לא שעות.\n"
+            f"⚠️ המספרים לא שוחזרו במלואם ע\"י tools/tf_engine.py — "
+            f"ר' 3.9.1. הכיוון מאושר, הגודל לא.\n"
             f"⚠️ מדגם דק. Forward test — בלי כסף, בלי לשנות פרמטרים.\n"
-            f"<i>מעקב בלבד — לא למסחר.</i>"
+            f"<i>מעקב בלבד — לא למסחר.</i>\n"
+            f"{TF_SIGNAL_CLOSE}"
         )
         send_telegram(msg)
         print(f"[TF-{name}] איתות: {direction} @{c:.2f} | סטופ {stop:.2f} | יעד {target:.2f}", flush=True)
 
-    if changed:
+    if changed or tf_closed_any:
         save_data(data)
 
 
@@ -2095,7 +2373,7 @@ def slow_scan_and_monitor(data):
         if (_sl and current_price <= sh_open["stop"]) or ((not _sl) and current_price >= sh_open["stop"]):
             _xp = sh_open["stop"]
             _pts = (_xp - sh_open["entry"]) if _sl else (sh_open["entry"] - _xp)
-            _pnl = (_pts - spread_pts) * sh_open.get("ils_per_pt", 0)
+            _pnl = (_pts - spread_pts) * sh_open.get("ils_per_pt", ils_per_point())
             sh_open["status"] = "closed"
             sh_open["result"] = "win" if _pnl > 0 else "loss"
             sh_open["pnl"] = round(_pnl, 2)
@@ -2132,15 +2410,18 @@ def slow_scan_and_monitor(data):
             exit_px = trail
             pts = (exit_px - open_trade["entry"]) if is_long else (open_trade["entry"] - exit_px)
             _tunits = open_trade.get("units") or [{"e": open_trade["entry"]}]
-            if len(_tunits) > 1:
-                # 3.9.0: שתי יחידות — חישוב בשקלים אמיתיים (0.75oz ליחידה),
-                # לא בסקאלת הסיכון. כל יחידה משלמת ספרד משלה.
-                pnl = 0.0
-                for _u in _tunits:
-                    _pu = (exit_px - _u["e"]) if is_long else (_u["e"] - exit_px)
-                    pnl += (_pu - spread_pts) * SLOW_LOT_OZ * USD_ILS
-            else:
-                pnl = (pts - spread_pts) * open_trade.get("ils_per_pt", points_to_ils(1))
+            # 3.9.2: הכל בגודל אמיתי (0.75oz ליחידה), כולל מימון לילה.
+            try:
+                _et = datetime.datetime.fromisoformat(open_trade["entry_time"]).replace(tzinfo=None)
+                _held = max(0.0, (now - _et).total_seconds() / 86400.0)
+            except (ValueError, KeyError, TypeError):
+                _held = 0.0
+            _gross = 0.0
+            for _u in _tunits:
+                _pu = (exit_px - _u["e"]) if is_long else (_u["e"] - exit_px)
+                _gross += (_pu - spread_pts) * REPORT_LOT_OZ * USD_ILS
+            _fund = funding_cost_ils(REPORT_LOT_OZ * len(_tunits), _held)
+            pnl = _gross - _fund
             result = "win" if pnl > 0 else "loss"
             _finalize_trade(data, open_trade, result, pnl)
             save_data(data)
@@ -2149,10 +2430,9 @@ def slow_scan_and_monitor(data):
             send_telegram(
                 f"{icon} <b>עסקה {fmt_tn(open_trade['number'])} — הסטופ הנגרר נחצה. נסגרה אוטומטית.</b>\n"
                 f"{symbol_name} | מחיר: {round(current_price, 2)} | יציאה: {round(exit_px, 2)}\n"
-                f"💰 {pnl:+.2f} ש\"ח"
-                + (f" ({len(_tunits)} יחידות × {SLOW_LOT_OZ}oz)" if len(_tunits) > 1 else "")
-                + " | החזקה: "
-                f"{max(0, (now - datetime.datetime.fromisoformat(open_trade['entry_time']).replace(tzinfo=None)).days)} ימים\n"
+                f"💰 <b>{pnl:+.2f} ש\"ח</b>  "
+                f"({len(_tunits)}×{REPORT_LOT_OZ}oz, שקלים אמיתיים)\n"
+                f"   ברוטו {_gross:+.2f} | מימון {-_fund:.2f} ({_held:.1f} ימים)\n"
                 + (f"(סגור את <b>שתי</b> הפוזיציות בפלוס500 עכשיו — אשר קבלה 👇)"
                    if len(_tunits) > 1 else f"(סגור גם בפלוס500 עכשיו — אשר קבלה 👇)"),
                 keyboard
@@ -2188,7 +2468,7 @@ def slow_scan_and_monitor(data):
             if _sp > 1e-6:
                 data.setdefault("slow_shadow", []).append({
                     "direction": _d, "entry": _e, "stop": _tr,
-                    "ils_per_pt": round(SLOW_RISK_ILS / _sp, 4),
+                    "ils_per_pt": round(ils_per_point(), 4),
                     "entry_time": now.isoformat(), "candle": last_key,
                     "status": "open"
                 })
@@ -2272,8 +2552,11 @@ def slow_scan_and_monitor(data):
     stop_pts = abs(entry_px - trail0)
     if stop_pts < 1e-6:
         return
-    ils_per_pt = SLOW_RISK_ILS / stop_pts
-    oz = ils_per_pt / USD_ILS
+    # 3.9.2: הדיווח בגודל אמיתי. הסיכון הוא תוצאה של רוחב הסטופ,
+    # לא קלט — כי הגודל קבוע על המינימום של פלוס500.
+    ils_per_pt = ils_per_point()
+    risk_real = (stop_pts + SPREAD_POINTS) * REPORT_LOT_OZ * USD_ILS
+    risk_pct = 100.0 * risk_real / ACCOUNT_SIZE if ACCOUNT_SIZE else 0.0
 
     # 3.9.0: פירמידינג — ATR14 על 4h בזמן הכניסה קובע את טריגר ההוספה.
     # עבר בלבד (נרות סגורים), כמו בסימולציה.
@@ -2305,6 +2588,7 @@ def slow_scan_and_monitor(data):
         {"text": "❌ דילגתי", "callback_data": f"sk_{trade_id}"}
     ]]
     send_telegram(
+        f"{sig_open(2)}\n"
         f"🐢 <b>איתות שיטה 2 — {num} — {symbol_name}</b>\n"
         f"🕐 {now.strftime('%d/%m %H:%M')} | נר 4 שעות נסגר "
         f"{'מעל שיא' if is_long else 'מתחת שפל'} {SLOW_ENTRY_DAYS} ימים\n"
@@ -2316,10 +2600,14 @@ def slow_scan_and_monitor(data):
         + (f"🪜 טריגר להוספה (יחידה 2, {SLOW_LOT_OZ} אונקיה): נר 4ש' נסגר "
            f"{'מעל' if is_long else 'מתחת'} <b>{add_trigger}</b> — תישלח התראה\n"
            if add_trigger else "")
-        + f"📏 סקאלת דוח לסיכון {SLOW_RISK_ILS:.0f} ש\"ח: {oz:.2f} אונקיות\n"
+        + f"💸 <b>הסיכון האמיתי: {risk_real:.0f} ש\"ח</b> ({risk_pct:.0f}% מהחשבון) "
+        f"— {REPORT_LOT_OZ}oz × {stop_pts:.1f}$ + ספרד\n"
+        f"💸 מימון לילה: {FUNDING_ILS_PER_OZ_DAY * SLOW_LOT_OZ:.2f} ש\"ח ליום "
+        f"ליחידה (נמדד)\n"
         f"⏳ החזקה צפויה: ימים עד שבועות | תוקף האיתות: {SLOW_PENDING_HOURS} שעות\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"(פותחים {SLOW_LOT_OZ} אונקיה בפלוס500 — לא יותר. ההוספה רק בהתראה.)",
+        f"(פותחים {SLOW_LOT_OZ} אונקיה בפלוס500 — לא יותר. ההוספה רק בהתראה.)\n"
+        f"{sig_close(2)}",
         keyboard
     )
     save_data(data)
@@ -2533,8 +2821,8 @@ def run_cross_check(data):
         real_day = [t for t in data.get("trades", [])
                     if str(t.get("entry_time", "")).startswith(day)]
         real_day.sort(key=lambda t: t.get("entry_time", ""))
-        real_pnl = data.get("daily_stats", {}).get(day, {}).get("pnl")
-        pnl_txt = f"{real_pnl:+.0f} ש\"ח" if isinstance(real_pnl, (int, float)) else "—"
+        day_pnl = data.get("daily_stats", {}).get(day, {}).get("pnl")
+        pnl_txt = f"{day_pnl:+.0f} ש\"ח" if isinstance(day_pnl, (int, float)) else "—"
         lines.append(f"👤 <b>הבוט החי</b> — {len(real_day)} עסק' | {pnl_txt}:")
         if real_day:
             for t in real_day:
@@ -2750,9 +3038,17 @@ def handle_callbacks(data, last_update_id):
                         "id": trade_id, "number": num, "symbol": signal["symbol"],
                         "direction": signal["direction"], "entry": signal["entry"],
                         "stop": signal["stop"], "target1": None, "target2": None,
-                        "system": 2, "ils_per_pt": signal.get("ils_per_pt", 1.0),
+                        "system": 2, "ils_per_pt": signal.get("ils_per_pt", ils_per_point()),
                         "stars": None, "entry_time": signal_dt.isoformat(),
                         "confirmed_time": now.isoformat(), "status": "open",
+                        # ── 3.9.3: השדות האלה נכתבו ל-pending ב-3.9.0 אבל
+                        # מעולם לא הועתקו לרשומת העסקה. התוצאה:
+                        # open_trade.get("add_trigger") היה תמיד None,
+                        # ולכן **הפירמידינג של 3.9.0 מעולם לא ירה בחי.**
+                        "units": signal.get("units") or [{"e": signal["entry"]}],
+                        "add_trigger": signal.get("add_trigger"),
+                        "n_atr": signal.get("n_atr"),
+                        "be_hit": signal.get("be_hit", False),
                     }
                     data["trades"].append(trade)
                     pending.pop(trade_id, None)
@@ -2849,6 +3145,26 @@ def handle_callbacks(data, last_update_id):
                 if not trade:
                     send_telegram("⚠️ לא נמצאה עסקה פתוחה")
                     continue
+                # ── 3.9.3: שיטה 2 נסגרת לפי מחיר, לא לפי "סוג יציאה" ──
+                # שלוש סיבות: (1) אין לה target1 — הכפתור "הגעתי לטארגט"
+                # קרס ב-TypeError. (2) המסלולים הישנים חישבו ב-1.5oz בלי
+                # מימון — בדיוק הבאג ש-3.9.2 נועד לתקן, ורק המסלול
+                # האוטומטי תוקן. (3) מחיר הסגירה בפועל שונה מהסטופ הנגרר
+                # שהבוט מניח; בעסקה איטי #1 הפער היה 38.94$.
+                if trade.get("system") == 2:
+                    trade["waiting_close_px"] = True
+                    save_data(data)
+                    _u = len(trade.get("units") or [1])
+                    send_telegram(
+                        f"🐢 <b>עסקה {fmt_tn(trade.get('number','?'))} — באיזה מחיר נסגרת?</b>\n"
+                        f"שלח את <b>Close Rate</b> מפלוס500 (לדוגמה: 4390.74).\n"
+                        f"כניסה רשומה: {trade.get('entry')} | "
+                        f"{_u} יח' × {REPORT_LOT_OZ}oz | "
+                        f"מוחזקת {slow_held_days(trade):.1f} ימים\n"
+                        f"<i>אם המחיר שונה מהמחיר שהבוט הניח — זה מה שקובע.</i>"
+                    )
+                    print(f"[CALLBACK] 🔒 שיטה 2 — ממתין למחיר סגירה: {trade_id}", flush=True)
+                    continue
                 keyboard = [
                     [{"text": "🎯 הגעתי לטארגט", "callback_data": f"rf_{trade_id}"}],
                     [{"text": "💰 יצאתי מוקדם", "callback_data": f"re_{trade_id}"}],
@@ -2868,6 +3184,16 @@ def handle_callbacks(data, last_update_id):
                     trade["ack"] = True
                     save_data(data)
                     send_telegram(f"👍 עסקה {fmt_tn(trade.get('number','?'))} כבר נסגרה אוטומטית ({trade.get('pnl')} ש\"ח) — נרשם")
+                    continue
+                # 3.9.3: מגן — שיטה 2 אין לה target1 (None). לפני התיקון
+                # הכפתור הזה קרס ב-TypeError על עסקת שיטה 2.
+                if trade.get("system") == 2 or trade.get("target1") is None:
+                    trade["waiting_close_px"] = True
+                    save_data(data)
+                    send_telegram(
+                        f"🐢 לעסקה {fmt_tn(trade.get('number','?'))} אין טארגט קבוע.\n"
+                        f"שלח את <b>Close Rate</b> מפלוס500 ואחשב רווח אמיתי."
+                    )
                     continue
                 risk_distance = abs(trade["entry"] - trade["stop"])
                 reward_distance = abs(trade["target1"] - trade["entry"])
@@ -2895,6 +3221,15 @@ def handle_callbacks(data, last_update_id):
                 if not trade:
                     send_telegram("⚠️ לא נמצאה עסקה")
                     continue
+                if trade.get("system") == 2:
+                    trade["waiting_close_px"] = True
+                    save_data(data)
+                    send_telegram(
+                        f"🐢 עסקה {fmt_tn(trade.get('number','?'))} — שלח את "
+                        f"<b>Close Rate</b> מפלוס500 (לא סכום). "
+                        f"אני מחשב ברוטו, מימון ונטו."
+                    )
+                    continue
                 trade["waiting_early_exit"] = True
                 save_data(data)
                 send_telegram("💰 <b>כמה עשית?</b>\nשלח לי את הסכום בש\"ח")
@@ -2910,6 +3245,17 @@ def handle_callbacks(data, last_update_id):
                     trade["ack"] = True
                     save_data(data)
                     send_telegram(f"👍 עסקה {fmt_tn(trade.get('number','?'))} כבר נסגרה אוטומטית ({trade.get('pnl')} ש\"ח) — נרשם")
+                    continue
+                # 3.9.3: מגן — שיטה 2 נסגרת לפי מחיר אמיתי, לא לפי הסטופ
+                # הרשום. הסטופ הנגרר זז ואינו מחיר היציאה בפועל.
+                if trade.get("system") == 2:
+                    trade["waiting_close_px"] = True
+                    save_data(data)
+                    send_telegram(
+                        f"🐢 עסקה {fmt_tn(trade.get('number','?'))} — שלח את "
+                        f"<b>Close Rate</b> מפלוס500 ואחשב הפסד אמיתי "
+                        f"(0.75oz, כולל מימון)."
+                    )
                     continue
                 risk_distance = abs(trade["entry"] - trade["stop"])
                 loss = round(points_to_ils(risk_distance) + SPREAD_COST_ILS, 2)
@@ -3117,7 +3463,7 @@ def handle_callbacks(data, last_update_id):
                     in_hours = _th["start"] <= now.hour < _th["end"]
                     evening = now.hour >= LAST_ENTRY_HOUR
                     send_telegram(
-                        f"🩺 <b>סטטוס — גרסה 3.4</b>\n"
+                        f"🩺 <b>סטטוס — גרסה {BOT_VERSION}</b>\n"
                         f"✅ חי | 🕐 {now.strftime('%H:%M:%S')}\n"
                         f"🔎 סריקה אחרונה: {scan_txt}\n"
                         f"📈 מגמה: {trend_txt}\n"
@@ -3131,6 +3477,44 @@ def handle_callbacks(data, last_update_id):
                     )
                 except Exception as e:
                     send_telegram(f"🩺 חי, אבל שגיאה בהרכבת הסטטוס: {e}")
+                continue
+
+            # ── 3.9.3: מחיר סגירה אמיתי לעסקת שיטה 2 ─────────────────
+            px_trade = next((t for t in data["trades"]
+                             if t.get("waiting_close_px") and t["status"] == "open"), None)
+            if px_trade:
+                try:
+                    exit_px = float(text.replace(",", "").strip())
+                except ValueError:
+                    send_telegram("⚠️ שלח מספר בלבד — למשל 4390.74")
+                    continue
+                if not (100.0 < exit_px < 100000.0):
+                    send_telegram("⚠️ המחיר לא נראה סביר לזהב. שלח שוב.")
+                    continue
+                net, gross, fund, days = slow_real_pnl(
+                    px_trade, exit_px, charge_spread=False)
+                _u = len(px_trade.get("units") or [1])
+                _is_long = px_trade.get("direction") == "קנייה"
+                _pts = ((exit_px - px_trade["entry"]) if _is_long
+                        else (px_trade["entry"] - exit_px))
+                px_trade["exit"] = exit_px
+                px_trade["exit_source"] = "manual_plus500"
+                px_trade.pop("waiting_close_px", None)
+                _finalize_trade(data, px_trade, "win" if net > 0 else "loss", net)
+                px_trade["ack"] = True
+                save_data(data)
+                send_telegram(
+                    f"{'🎉' if net > 0 else '📉'} <b>עסקה "
+                    f"{fmt_tn(px_trade.get('number','?'))} נסגרה — "
+                    f"{net:+.2f} ש\"ח נטו</b>\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"כניסה {px_trade['entry']} → יציאה {exit_px} "
+                    f"({_pts:+.2f}$)\n"
+                    f"{_u} יח' × {REPORT_LOT_OZ}oz | {days:.2f} ימי החזקה\n"
+                    f"ברוטו {gross:+.2f} | מימון {-fund:.2f}\n"
+                    f"<i>ספרד לא נוכה — הוא כבר בתוך שערי פלוס500.</i>"
+                )
+                print(f"[SLOW] סגירה ידנית @{exit_px} → {net:+.2f} ש\"ח", flush=True)
                 continue
 
             waiting_trade = next((t for t in data["trades"] if t.get("waiting_early_exit") and t["status"] == "open"), None)
@@ -3165,6 +3549,49 @@ def handle_callbacks(data, last_update_id):
 # ============================================================
 # מעקב עסקאות פתוחות + זיהוי אוטומטי (high/low)
 # ============================================================
+def slow_held_days(trade, close_dt=None):
+    """3.9.3: ימי החזקה בפועל. קורא entry_time — לא "time", שלא קיים
+    ברשומת עסקה (הוא קיים רק ב-pending). זה היה מקור באג שהראה
+    מימון 0 בכל דוח יומי."""
+    end = close_dt or now_il()
+    for k in ("entry_time", "confirmed_time", "time"):
+        raw = trade.get(k)
+        if not raw:
+            continue
+        try:
+            et = datetime.datetime.fromisoformat(raw)
+        except (ValueError, TypeError):
+            continue
+        if et.tzinfo and not end.tzinfo:
+            et = et.replace(tzinfo=None)
+        elif end.tzinfo and not et.tzinfo:
+            et = et.replace(tzinfo=end.tzinfo)
+        return max(0.0, (end - et).total_seconds() / 86400.0)
+    return 0.0
+
+
+def slow_real_pnl(trade, exit_px, close_dt=None, charge_spread=True):
+    """3.9.3: רווח/הפסד אמיתי לעסקת שיטה 2, בגודל REPORT_LOT_OZ ליחידה.
+    מחזיר (net, gross, funding, days).
+
+    charge_spread=False כשמחיר היציאה הוא מילוי אמיתי מפלוס500 — שם
+    הספרד כבר בתוך שערי הפתיחה והסגירה (מסך Closed Position: Net P&L
+    = P&L מינוס מימון בלבד, אין שורת ספרד). כשהמחיר מגיע מנר/סטופ
+    מחושב — הספרד כן נגבה."""
+    is_long = trade.get("direction") == "קנייה"
+    units = trade.get("units") or [{"e": trade.get("entry")}]
+    days = slow_held_days(trade, close_dt)
+    gross = 0.0
+    for u in units:
+        e = u.get("e", trade.get("entry"))
+        pts = (exit_px - e) if is_long else (e - exit_px)
+        if charge_spread:
+            pts -= SPREAD_POINTS
+        gross += pts * REPORT_LOT_OZ * USD_ILS
+    fund = funding_cost_ils(REPORT_LOT_OZ * len(units), days)
+    return round(gross - fund, 2), round(gross, 2), round(fund, 2), days
+
+
 def _finalize_trade(data, trade, result, pnl, close_dt=None):
     """3.4: סגירה רשמית ברגע הזיהוי — close_time לפי השוק, לא לפי האישור."""
     trade["status"] = "closed"
@@ -3388,13 +3815,77 @@ def send_daily_report(data):
         + (f"👋 דילגת על: {skipped}\n" if skipped else "")
     ) if (shadows_today or sh_open or blocked or skipped) else ""
 
+    # ── 3.9.1: שיטה 2 — הדוח היה עיוור אליה לגמרי ────────────────
+    # עד כאן הדוח קרא רק signals_sent/entered/pnl/shadow_trades, שכולם
+    # שייכים לשיטה 1. שיטה 2 היא היחידה שחיה עם כפתורים — והיא לא הופיעה.
+    s2_open = [t for t in data.get("trades", [])
+               if t.get("system") == 2 and t.get("status") == "open"]
+    s2_closed_today = [t for t in data.get("trades", [])
+                       if t.get("system") == 2 and t.get("status") == "closed"
+                       and str(t.get("close_time", "")).startswith(today)]
+    s2_pending = {k: v for k, v in data.get("pending", {}).items()
+                  if v.get("system") == 2}
+    s2_shadow_open = [s for s in data.get("slow_shadow", [])
+                      if s.get("status") == "open"]
+
+    s2 = f"\n{METHOD_MARK[2]} <b>שיטה 2 (דונקיאן {SLOW_ENTRY_DAYS}/{SLOW_TRAIL_DAYS}):</b>\n"
+    if s2_open:
+        for t in s2_open:
+            units = t.get("units", [{"e": t.get("entry")}])
+            oz = len(units) * SLOW_LOT_OZ
+            # 3.9.3: היה t["time"] — מפתח שלא קיים ברשומת עסקה (רק
+            # ב-pending). ה-except בלע את ה-KeyError והמימון הוצג
+            # כ-0 בכל דוח, תמיד.
+            days = slow_held_days(t)
+            s2 += (f"📍 פתוחה: {t.get('direction')} @{t.get('entry')} | "
+                   f"{len(units)} יח' ({oz:.2f} אונקיות)\n"
+                   f"🛑 סטופ נגרר: {t.get('stop')}"
+                   + (" (ברייקאיבן פעיל)" if t.get("be_hit") else "") + "\n"
+                   f"⏳ מוחזקת {days:.1f} ימים | "
+                   f"💸 מימון מצטבר: {funding_cost_ils(oz, days):.1f}- ש\"ח\n")
+            if t.get("add_trigger") and len(units) < SLOW_PYRAMID_UNITS:
+                s2 += f"🪜 טריגר ליחידה הבאה: {t['add_trigger']}\n"
+    elif s2_pending:
+        s2 += f"⏳ איתות ממתין לאישור: {len(s2_pending)}\n"
+    else:
+        s2 += "😴 אין פוזיציה ואין איתות ממתין.\n"
+    if s2_closed_today:
+        s2 += (f"🔚 נסגרו היום: {len(s2_closed_today)} | "
+               f"{round(sum(t.get('pnl', 0) for t in s2_closed_today), 2)} ש\"ח\n")
+    if s2_shadow_open:
+        sh = s2_shadow_open[0]
+        s2 += (f"👁️ צל: {sh.get('direction')} @{sh.get('entry')} | "
+               f"סטופ {sh.get('stop')}\n")
+
+    # ── 3.9.1: שיטה 3 — איתותי 4H/6H מ-tf_signals ────────────────
+    tf_all = data.get("tf_signals", [])
+    tf_today = [s for s in tf_all if str(s.get("time", "")).startswith(today)]
+    s3 = f"\n{METHOD_MARK[3]} <b>שיטה 3 (מעקב בלבד):</b>\n"
+    if tf_today:
+        for s in tf_today:
+            mark = ""
+            if s.get("tf") == "4H":
+                mark = " ✅גיבוי 6H" if s.get("backup") else " ⚠️בלי גיבוי (37%)"
+            s3 += (f"{s.get('tf')}: {s.get('direction')} @{s.get('entry')} | "
+                   f"סטופ {s.get('stop')} | יעד {s.get('target')}{mark}\n")
+        n_no = sum(1 for s in tf_today
+                   if s.get("tf") == "4H" and s.get("backup") is False)
+        if n_no:
+            s3 += f"⚠️ {n_no} איתותי 4H בלי גיבוי 6H — הקבוצה המפסידה.\n"
+    else:
+        s3 += "אין איתותים חדשים היום.\n"
+    tf_week = len([s for s in tf_all[-60:]])
+    s3 += f"📚 סה\"כ איתותים ביומן: {tf_week}\n"
+
     send_telegram(
         f"📊 <b>דוח יומי — {today}</b>\n\n"
-        f"💼 <b>התיק שלך:</b>\n"
+        f"{METHOD_MARK[1]} <b>שיטה 1 (מעקב בלבד) + התיק שלך:</b>\n"
         f"🔔 איתותים שנשלחו: {signals_today}\n"
         f"✅ עסקאות שנכנסת: {entered_today}\n"
         f"💰 רווח/הפסד היום: {round(pnl_today, 2)} ש\"ח\n"
-        f"{shadow_section}\n"
+        f"{shadow_section}"
+        f"{s2}"
+        f"{s3}\n"
         f"📈 סה\"כ עסקאות: {stats['total_trades']}\n"
         f"✅ רווחים: {stats['wins']} | ❌ הפסדים: {stats['losses']}\n"
         f"📊 אחוז הצלחה: {win_rate}%\n"
@@ -3406,9 +3897,9 @@ def send_daily_report(data):
 # לולאה ראשית
 # ============================================================
 def main():
-    print("🤖 בוט מסחר מופעל! [גרסה 3.9.0 — פירמידינג שיטה 2 🪜]", flush=True)
+    print(f"🤖 בוט מסחר מופעל! [גרסה {BOT_VERSION}]", flush=True)
     print(f"TOKEN exists: {bool(TELEGRAM_TOKEN)}", flush=True)
-    print(f"CHAT_ID: {CHAT_ID}", flush=True)
+    print(f"CHAT_ID set: {bool(CHAT_ID)}", flush=True)
     print(f"GIST configured: {gist_enabled()}", flush=True)
     gist_diagnose()
 
@@ -3424,12 +3915,15 @@ def main():
         storage_line = "⚠️ אחסון זמני בלבד (/tmp) — הגדר GIST_ID + GIST_TOKEN ב-Render"
 
     send_telegram(
-        "🤖 <b>בוט המסחר הופעל!</b> (גרסה 3.9.0)\n\n"
+        f"🤖 <b>בוט המסחר הופעל!</b> (גרסה {BOT_VERSION})\n\n"
         "🐢 <b>שיטה 2 — למסחר:</b> פריצת 20 ימים על נר 4 שעות,\n"
         "סטופ נגרר, בלי טארגט. איתות עם כפתורים = אמיתי.\n"
         "צפי: 1-2 איתותים בשבוע. שקט = תקין.\n\n"
-        "🚨 <b>המערכת הישנה — מעקב בלבד:</b> בלי כפתורים,\n"
-        "לא למסחר. הסימולציה ממשיכה לרשום אותה.\n\n"
+        + ("🔇 <b>שיטה 1 — שקטה:</b> רצה ברקע, לא שולחת הודעות.\n"
+           "הצללים והדוח היומי ממשיכים כרגיל.\n\n"
+           if OLD_SIGNALS_SILENT else
+           "🚨 <b>המערכת הישנה — מעקב בלבד:</b> בלי כפתורים,\n"
+           "לא למסחר. הסימולציה ממשיכה לרשום אותה.\n\n") +
         "💡 /backtest | /h1 | /h2 | /h3 | /h8 | /h9 | /shadow2 | /reset | /status | /mfe | /cross | /slow\n"
         f"{storage_line}"
     )
