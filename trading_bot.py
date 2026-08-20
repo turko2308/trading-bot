@@ -154,12 +154,64 @@ def sig_close(system):
 TF_SIGNAL_OPEN = sig_open(3)
 TF_SIGNAL_CLOSE = sig_close(3)
 
+
+# ── 3.9.4 · תיקון 4: מספור איתותים ────────────────────────────
+# מונה מתמיד ב-data ולא אינדקס במערך: tf_scan קורא log[-40:], וכשהיומן
+# ייחתך אינדקס יזוז והמספרים ישתנו למפרע.
+def tf_signal_id(data):
+    """מחזיר את המספר הרץ הבא לאיתות שיטה 3, ומקדם את המונה."""
+    seq = int(data.get("tf_seq", 0)) + 1
+    data["tf_seq"] = seq
+    return seq
+
+
+def tf_backfill_ids(data):
+    """מילוי לאחור חד-פעמי: רשומות ותיקות בלי id מקבלות מספר לפי סדר
+    זמן עולה. לא מוחק כלום ולא רץ שוב אחרי שהמונה נקבע."""
+    log = data.get("tf_signals") or []
+    missing = [s for s in log if not s.get("id")]
+    if not missing:
+        data.setdefault("tf_seq", max([int(s.get("id", 0)) for s in log] or [0]))
+        return False
+    for n, s in enumerate(sorted(missing, key=lambda x: str(x.get("time", ""))), 1):
+        s["id"] = n
+    data["tf_seq"] = max(int(s.get("id", 0)) for s in log)
+    return True
+
+
+def fmt_sig_id(n):
+    return f"#{int(n):03d}" if n else "#???"
+
+
+# ── 3.9.4 · תיקון 10: מתי נסגר נר ה-6H הבא ────────────────────
+# נרות 6H נסגרים ב-00/06/12/18. מכל נר 4H המרחק קבוע, ולכן איתות 4H
+# ב-00:00 או ב-12:00 לעולם לא יקבל גיבוי — הנר הבא ב-6 שעות והחלון 4.
+# אימות על 2.5 שנים: 0/23 בשעות האלה מול 96/174 בשאר.
+def next_6h_close(now):
+    """מחזיר (מועד סגירת נר 6H הבא, שעות עד אז)."""
+    nxt = min((h - now.hour) % 24 or 24 for h in (0, 6, 12, 18))
+    when = (now + datetime.timedelta(hours=nxt)).replace(
+        minute=0, second=0, microsecond=0)
+    return when, (when - now).total_seconds() / 3600.0
+
+
+def backup_window_txt(now):
+    """שורת הסטופר לאיתות 4H שאין לו גיבוי."""
+    when, hrs = next_6h_close(now)
+    if hrs > TF_BACKUP_WINDOW_H + 1e-9:
+        return (f"⛔ נר 6H הבא ב-{when.strftime('%H:%M')} — "
+                f"{hrs:.0f} שעות, מחוץ לחלון של {TF_BACKUP_WINDOW_H}.\n"
+                f"   האיתות הזה לא יקבל גיבוי.")
+    left = max(0.0, hrs)
+    return (f"⏱ נר 6H נסגר ב-{when.strftime('%H:%M')} "
+            f"(בעוד {int(left)}:{int(round((left % 1) * 60)):02d})")
+
 # ── 3.9.3: חותמת גרסה על כל רשומה שנשמרת ──────────────────────
 # הצורך: מ-3.9.2 השדה `pnl` מודד דבר אחר לגמרי (0.75oz נטו במקום
 # סקאלת סיכון 40 ש"ח). רשומה ישנה וחדשה נראות זהות ואי אפשר להבדיל
 # ביניהן בדיעבד. הכלל "אל תערבב נתונים משתי סקאלות" תוחזק עד היום
 # לפי תאריך בלבד — עכשיו הוא נאכף בנתונים עצמם.
-BOT_VERSION = "3.9.3"
+BOT_VERSION = "3.9.4"
 PNL_SCALE = "0.75oz-net"        # מה שהשדה pnl מודד בגרסה הזו
 
 DATA_FILE = "/tmp/bot_data.json"
@@ -2149,24 +2201,37 @@ def tf_monitor(data, h1):
         sig["bars_held"] = sum(1 for b in bars if b["t"] <= exit_t)
         changed = True
 
-        icon = "🎯" if hit == "win" else "🛑"
+        # 3.9.4 · תיקונים 5+6: הודעת הסגירה עומדת לבדה — מי שקורא
+        # אותה לא רואה את הפתיחה. שבעה שדות: מזהה, מסגרת וכיוון,
+        # תאריך הנר, מחירים, סיבת יציאה, מצב גיבוי, תוצאה. ובנוסף
+        # השורה המצטברת, שעד 3.9.3 הלכה ל-print() בלבד ולא הגיעה
+        # לטלגרם — ולכן ה-forward test לא נראה לאיש.
+        _closed = [x for x in log if x.get("status") == "closed"]
+        _w = sum(1 for x in _closed if x.get("result") == "win")
+        _tot = round(sum(x.get("pnl", 0) for x in _closed), 2)
+        _cum = (f"\nמצטבר שיטה 3: {len(_closed)} סגורות · "
+                f"{100*_w/len(_closed):.0f}% · {_tot:+.0f} ש\"ח"
+                if _closed else "")
+        _bk = {True: "✅ היה", False: "⚠️ לא היה"}.get(sig.get("backup"), "—")
+        if sig.get("backup") is True and sig.get("backup_late_h"):
+            _bk = f"✅ מאוחר (+{sig['backup_late_h']} ש')"
+        try:
+            _cand = t0.strftime("%d/%m %H:%M")
+        except Exception:
+            _cand = str(sig.get("candle", "?"))
         send_telegram(
-            f"{METHOD_MARK[3]} <b>[מעקב] שיטה 3 — {sig.get('tf')} נסגרה</b> {icon}\n"
-            f"{sig.get('direction')} {entry} → {sig['exit']} ({pts:+.1f}$)\n"
-            f"💰 {pnl:+.2f} ש\"ח ({REPORT_LOT_OZ}oz תיאורטי)\n"
-            f"⏳ {sig['bars_held']} שעות"
-            + (" | ✅ היה גיבוי 6H" if sig.get("backup") is True else "")
-            + (" | ⚠️ בלי גיבוי 6H" if sig.get("backup") is False else "")
+            f"{METHOD_MARK[3]} <b>עסקה שיטה 3 {fmt_sig_id(sig.get('id'))} — "
+            f"{'היעד הושג' if hit == 'win' else 'הסטופ נפגע'}</b>\n\n"
+            f"{sig.get('tf')} · {sig.get('direction')} · נר {_cand}\n"
+            f"כניסה {entry} → יציאה {sig['exit']}  ({pts:+.1f}$)\n"
+            f"<b>{pnl:+.2f} ש\"ח</b> ({REPORT_LOT_OZ}oz)\n"
+            f"החזקה {sig['bars_held']} שעות · גיבוי 6H: {_bk}\n"
+            f"{_cum}\n"
+            f"{TF_SIGNAL_CLOSE}"
         )
-        print(f"[TF-{sig.get('tf')}] נסגרה: {hit} {pnl:+.2f}", flush=True)
+        print(f"[TF-{sig.get('tf')}] {fmt_sig_id(sig.get('id'))} נסגרה: "
+              f"{hit} {pnl:+.2f}", flush=True)
 
-    # סיכום מצטבר — הדבר שה-forward test קיים בשבילו
-    closed = [x for x in log if x.get("status") == "closed"]
-    if changed and len(closed) >= 5:
-        w = sum(1 for x in closed if x["result"] == "win")
-        tot = round(sum(x.get("pnl", 0) for x in closed), 2)
-        print(f"[TF] מצטבר: {len(closed)} עסק' | {100*w/len(closed):.0f}% | "
-              f"{tot:+.2f} ש\"ח", flush=True)
     return changed
 
 
@@ -2176,6 +2241,9 @@ def tf_scan(data):
     h1 = _fetch_history(symbol, "1h", 800)
     if not h1 or len(h1) < 400:
         return
+
+    # 3.9.4 · תיקון 4: מילוי מספרים לרשומות ותיקות, חד-פעמי.
+    tf_filled = tf_backfill_ids(data)
 
     # 3.9.3: קודם סוגרים מה שפתוח, אחר כך מחפשים חדש.
     tf_closed_any = tf_monitor(data, h1)
@@ -2250,7 +2318,9 @@ def tf_scan(data):
                     backup = s
                     break
 
+        sig_id = tf_signal_id(data)          # 3.9.4 · תיקון 4
         log.append({
+            "id": sig_id,
             "tf": name, "direction": direction, "entry": round(c, 2),
             "stop": round(stop, 2), "target": round(target, 2),
             "atr": round(atr, 2), "candle": key, "risk_usd": round(risk_usd, 2),
@@ -2274,66 +2344,54 @@ def tf_scan(data):
                         s["backup"] = True
                         s["backup_late_h"] = round(
                             (now_il() - st).total_seconds() / 3600.0, 1)
+                        # 3.9.4 · תיקון 9: הנוסח הקודם אמר "עובר מ-37%
+                        # ל-62%". שני המספרים שגויים. הקבוצה בפועל היא
+                        # 70.6% (+52.1 ש"ח/עסקה) — הקבוצה החזקה בשיטה.
+                        # אבל היא נמדדה עם כניסה במחיר סגירת נר ה-4H,
+                        # שכבר חלף. מי שנכנס עכשיו תופס 61.5% (+40.2).
                         send_telegram(
-                            f"🟧 <b>[שיטה 3] גיבוי 6H הגיע</b>\n"
-                            f"האיתות של 4H מ-{st.strftime('%d/%m %H:%M')} "
-                            f"({s['direction']} @{s['entry']}) קיבל גיבוי 6H "
-                            f"באותו כיוון אחרי {s['backup_late_h']} שעות.\n"
-                            f"הוא עובר מקבוצת <b>37%</b> לקבוצת <b>62%</b>."
+                            f"{METHOD_MARK[3]} <b>[שיטה 3] גיבוי 6H הגיע — "
+                            f"{fmt_sig_id(s.get('id'))}</b>\n"
+                            f"4H {s['direction']} @{s['entry']} "
+                            f"מ-{st.strftime('%d/%m %H:%M')} — "
+                            f"גיבוי אחרי {s['backup_late_h']} שעות.\n"
+                            f"✅ נכנסת בזמן ב-{s['entry']}? זו הקבוצה "
+                            f"החזקה בשיטה: <b>70.6%</b>, ‏52.1+ ש\"ח.\n"
+                            f"↩️ לא נכנסת? היכנס לפי איתות ה-6H — מחיר, "
+                            f"סטופ ויעד <b>שלו</b>: <b>61.5%</b>, ‏40.2+.\n"
+                            f"⛔ אל תיכנס עכשיו במחיר ה-4H עם סטופ ה-4H."
                         )
                         break
 
-        # 3.9.1: סימון גיבוי 6H — הדבר הראשון שרואים באיתות 4H.
+        # 3.9.4 · תיקונים 7+10+11: ההודעה קוצרה לשורות שדרושות כדי
+        # להחליט ולפעול. הסטטיסטיקות שהיו כאן היו מקודדות קשיח וסתרו
+        # את §4.4 הקנוני — נמחקו במקום לתוקן. כל שדה ממשיך להיכתב
+        # לגיסט; הרישום לא השתנה, רק התצוגה.
         backup_line = ""
         if name == "4H":
             if backup:
-                backup_line = (
-                    f"✅ <b>יש גיבוי 6H</b> באותו כיוון "
-                    f"(מ-{backup['time'][11:16]}) — קבוצת <b>62%</b> הצלחה, "
-                    f"‏24.3+ ש\"ח לעסקה.\n")
+                backup_line = (f"✅ יש גיבוי 6H "
+                               f"(מ-{backup['time'][11:16]})\n")
             else:
-                backup_line = (
-                    f"⚠️ <b>אין גיבוי 6H — קבוצת 37% הצלחה.</b>\n"
-                    f"‏71 עסקאות כאלה ב-2.5 שנים: ‏2,094- ש\"ח, "
-                    f"‏29.5- לעסקה, שליליות בכל שלוש השנים (p=0.02-0.003).\n"
-                    f"גיבוי עוד יכול להגיע עד {TF_BACKUP_WINDOW_H} שעות — "
-                    f"תישלח התראה אם כן.\n")
+                backup_line = ("⚠️ אין גיבוי 6H\n"
+                               f"{backup_window_txt(now_il())}\n")
 
         msg = (
-            f"{TF_SIGNAL_OPEN}\n"
-            f"{METHOD_MARK[3]} <b>[מעקב בלבד] שיטה 3 — מסגרת {name}</b>\n"
-            f"🕐 {now_il().strftime('%d/%m %H:%M')} | נר {name} שנסגר\n"
-            f"{'─' * 22}\n"
-            f"{backup_line}"
-            f"📊 כיוון: <b>{direction}</b>\n"
-            f"💰 כניסה: {c:.2f}\n"
-            f"🛑 סטופ: {stop:.2f}  ({risk_usd:.1f}$)\n"
-            f"🎯 יעד: {target:.2f} ({abs(target-c):.1f}$ = 2×ATR)\n"
-            f"📏 ATR({TF_ATR_PERIOD}) = {atr:.2f}$\n"
-            f"{'─' * 22}\n"
-            f"⚖️ <b>גודל וסיכון — שקלים אמיתיים</b>\n"
-            f"גודל: <b>{REPORT_LOT_OZ} אונקיה</b> (המינימום בפלוס500)\n"
-            f"🔴 <b>הסיכון האמיתי: {risk_at_min_ils:.0f} ש\"ח</b> "
-            f"({100*risk_at_min_ils/ACCOUNT_SIZE:.0f}% מחשבון של {ACCOUNT_SIZE})\n"
-        )
-        if risk_at_min_ils > ACCOUNT_SIZE * 0.05:
-            msg += (f"⚠️ מעל 5% מהחשבון בעסקה אחת. "
-                    f"לסיכון סביר דרוש ~{risk_at_min_ils/0.05:,.0f} ש\"ח.\n")
-        msg += (
-            f"{'─' * 22}\n"
-            f"📈 בבדיקה (2.5 שנים): {cfg['far']['trades']} עסק' | "
-            f"{cfg['far']['pnl']} ש\"ח | {cfg['far']['periods']} תקופות חיוביות\n"
-            f"⏳ החזקה: ימים, לא שעות.\n"
-            f"⚠️ המספרים לא שוחזרו במלואם ע\"י tools/tf_engine.py — "
-            f"ר' 3.9.1. הכיוון מאושר, הגודל לא.\n"
-            f"⚠️ מדגם דק. Forward test — בלי כסף, בלי לשנות פרמטרים.\n"
+            f"{TF_SIGNAL_OPEN} · {fmt_sig_id(sig_id)}\n\n"
+            f"{name} · <b>{direction}</b> · נר {now_il().strftime('%d/%m %H:%M')}\n\n"
+            f"{backup_line}\n"
+            f"כניסה  <b>{c:.2f}</b>\n"
+            f"סטופ   {stop:.2f}   ({-risk_usd:.1f}$)\n"
+            f"יעד    {target:.2f}   (+{abs(target-c):.1f}$)\n"
+            f"ATR{TF_ATR_PERIOD}  {atr:.2f}$\n\n"
+            f"{REPORT_LOT_OZ}oz · סיכון {risk_at_min_ils:.0f} ש\"ח\n"
             f"<i>מעקב בלבד — לא למסחר.</i>\n"
             f"{TF_SIGNAL_CLOSE}"
         )
         send_telegram(msg)
         print(f"[TF-{name}] איתות: {direction} @{c:.2f} | סטופ {stop:.2f} | יעד {target:.2f}", flush=True)
 
-    if changed or tf_closed_any:
+    if changed or tf_closed_any or tf_filled:
         save_data(data)
 
 
@@ -3462,6 +3520,55 @@ def handle_callbacks(data, last_update_id):
                     _th = TRADING_HOURS.get("זהב", {"start": 6, "end": 22})
                     in_hours = _th["start"] <= now.hour < _th["end"]
                     evening = now.hour >= LAST_ENTRY_HOUR
+
+                    # ── 3.9.4 · תיקון 1 ──────────────────────────
+                    # כל שורה ב-/status עד 3.9.3 תיארה את שיטה 1 —
+                    # היחידה שמושתקת. שיטה 2 היא היחידה שחיה עם
+                    # כפתורים, ושיטה 3 היא ה-forward test; שתיהן לא
+                    # הופיעו כלל.
+                    s2o = [t for t in data.get("trades", [])
+                           if t.get("system") == 2 and t.get("status") == "open"]
+                    s2_txt = f"\n{METHOD_MARK[2]} <b>שיטה 2</b>\n"
+                    if s2o:
+                        for t in s2o:
+                            u = t.get("units", [{"e": t.get("entry")}])
+                            oz = len(u) * SLOW_LOT_OZ
+                            d = slow_held_days(t)
+                            s2_txt += (
+                                f"📍 {t.get('direction')} @{t.get('entry')} | "
+                                f"{len(u)} יח' ({oz:.2f}oz)\n"
+                                f"🛑 סטופ {t.get('stop')}"
+                                + (" · ברייקאיבן" if t.get("be_hit") else "") + "\n"
+                                f"⏳ {d:.1f} ימים | 💸 מימון "
+                                f"{funding_cost_ils(oz, d):.1f}- ש\"ח\n")
+                            if (t.get("add_trigger")
+                                    and len(u) < SLOW_PYRAMID_UNITS):
+                                s2_txt += f"🪜 יחידה הבאה: {t['add_trigger']}\n"
+                    else:
+                        s2_txt += "😴 אין פוזיציה.\n"
+
+                    tfl = data.get("tf_signals", [])
+                    tf_open = [s for s in tfl if s.get("status") == "open"]
+                    tf_cl = [s for s in tfl if s.get("status") == "closed"]
+                    s3_txt = f"\n{METHOD_MARK[3]} <b>שיטה 3</b>\n"
+                    if tf_open:
+                        for s in tf_open[-4:]:
+                            bk = (" ✅גיבוי" if s.get("backup") is True
+                                  else " ⚠️בלי" if s.get("backup") is False
+                                  else "")
+                            s3_txt += (f"{fmt_sig_id(s.get('id'))} "
+                                       f"{s.get('tf')} {s.get('direction')} "
+                                       f"@{s.get('entry')} | סטופ "
+                                       f"{s.get('stop')}{bk}\n")
+                    else:
+                        s3_txt += "😴 אין איתות פתוח.\n"
+                    if tf_cl:
+                        _w = sum(1 for s in tf_cl if s.get("result") == "win")
+                        s3_txt += (
+                            f"📚 {len(tfl)} ביומן | {len(tf_cl)} סגורות · "
+                            f"{100*_w/len(tf_cl):.0f}% · "
+                            f"{sum(s.get('pnl', 0) for s in tf_cl):+.0f} ש\"ח\n")
+
                     send_telegram(
                         f"🩺 <b>סטטוס — גרסה {BOT_VERSION}</b>\n"
                         f"✅ חי | 🕐 {now.strftime('%H:%M:%S')}\n"
@@ -3470,6 +3577,8 @@ def handle_callbacks(data, last_update_id):
                         f"🕗 שעות מסחר: {'כן' if in_hours else 'לא'}"
                         + (f" | 🌆 אחרי {LAST_ENTRY_HOUR}:00 — אין איתותים חדשים" if evening and in_hours else "") + "\n"
                         f"🛑 ברייקר: {'פעיל — עצירה עד מחר' if breaker else 'לא פעיל'}\n"
+                        + s2_txt + s3_txt
+                        + f"\n{METHOD_MARK[1]} <b>שיטה 1</b> <i>(מושתקת)</i>\n"
                         f"📂 סלוטים: {len(open_real)}/{MAX_PARALLEL_TRADES} תפוסים"
                         + (f" | 👁️ סימולציה פתוחה: {len(open_shadow)}" if open_shadow else "") + "\n"
                         + (f"🔔 ממתין לאישור שלך: {len(unacked)}\n" if unacked else "")
@@ -3858,27 +3967,75 @@ def send_daily_report(data):
                f"סטופ {sh.get('stop')}\n")
 
     # ── 3.9.1: שיטה 3 — איתותי 4H/6H מ-tf_signals ────────────────
+    # 3.9.4 · תיקון 2: עד 3.9.3 השורה סיננה לפי תאריך בלבד, בלי
+    # status — ואיתות שהסטופ שלו כבר נפגע הוצג כטרי, עם סטופ ויעד,
+    # בלי שום סימן. ובנוסף לא הייתה שורת "נסגרו היום" לשיטה 3
+    # (לשיטה 2 יש), ולכן תצפיות ה-forward test לא הופיעו בדוח כלל.
     tf_all = data.get("tf_signals", [])
     tf_today = [s for s in tf_all if str(s.get("time", "")).startswith(today)]
+    tf_closed_today = [s for s in tf_all
+                       if s.get("status") == "closed"
+                       and str(s.get("close_time", "")).startswith(today)]
+    _ST = {"open": "🟡 פתוח", "closed": "", "void": "⬛ בוטל",
+           "unresolved": "⬜ לא הוכרע"}
     s3 = f"\n{METHOD_MARK[3]} <b>שיטה 3 (מעקב בלבד):</b>\n"
     if tf_today:
         for s in tf_today:
+            st = s.get("status", "open")
+            if st == "closed":
+                tag = (f"🎯 יעד {s.get('pnl', 0):+.0f} ש\"ח"
+                       if s.get("result") == "win"
+                       else f"🛑 סטופ {s.get('pnl', 0):+.0f} ש\"ח")
+            else:
+                tag = _ST.get(st, st)
             mark = ""
             if s.get("tf") == "4H":
-                mark = " ✅גיבוי 6H" if s.get("backup") else " ⚠️בלי גיבוי (37%)"
-            s3 += (f"{s.get('tf')}: {s.get('direction')} @{s.get('entry')} | "
-                   f"סטופ {s.get('stop')} | יעד {s.get('target')}{mark}\n")
+                mark = (" ✅גיבוי" if s.get("backup") is True
+                        else " ⚠️בלי גיבוי" if s.get("backup") is False else "")
+            s3 += (f"{fmt_sig_id(s.get('id'))} {s.get('tf')} "
+                   f"{s.get('direction')} @{s.get('entry')} | "
+                   f"סטופ {s.get('stop')} | יעד {s.get('target')}"
+                   f"{mark} | {tag}\n")
         n_no = sum(1 for s in tf_today
                    if s.get("tf") == "4H" and s.get("backup") is False)
         if n_no:
             s3 += f"⚠️ {n_no} איתותי 4H בלי גיבוי 6H — הקבוצה המפסידה.\n"
     else:
         s3 += "אין איתותים חדשים היום.\n"
-    tf_week = len([s for s in tf_all[-60:]])
-    s3 += f"📚 סה\"כ איתותים ביומן: {tf_week}\n"
+    if tf_closed_today:
+        s3 += (f"🔚 נסגרו היום: {len(tf_closed_today)} | "
+               f"{round(sum(s.get('pnl', 0) for s in tf_closed_today), 2)} ש\"ח\n")
+    # 3.9.4 · תיקון 8: היה min(len,60) בתחפושת של "סה"כ ביומן".
+    s3 += f"📚 סה\"כ איתותים ביומן: {len(tf_all)}\n"
+
+    # 3.9.4 · תיקון 3: השורה הזאת קראה all_time_stats בלבד — שיטה 1.
+    # tf_monitor לא נוגעת ב-all_time_stats, ולכן שיטה 3 לא נספרה
+    # מעולם. הכותרת הכריזה "1 עסקה · 100% · 41.2 ש"ח" בזמן ש-11
+    # עסקאות אחרות היו סגורות ביומן. עכשיו כל שיטה מוצגת בנפרד,
+    # בלי לערבב סקאלות.
+    tf_done = [s for s in data.get("tf_signals", [])
+               if s.get("status") == "closed"]
+    s2_done = [t for t in data.get("trades", [])
+               if t.get("system") == 2 and t.get("status") == "closed"]
+
+    def _line(mark, label, rows, note=""):
+        if not rows:
+            return f"{mark} {label}: אין עסקאות סגורות{note}\n"
+        w = sum(1 for r in rows
+                if (r.get("result") == "win" or r.get("pnl", 0) > 0))
+        tot = round(sum(r.get("pnl", 0) for r in rows), 2)
+        return (f"{mark} {label}: {len(rows)} סגורות · "
+                f"{100*w/len(rows):.0f}% · {tot:+.0f} ש\"ח{note}\n")
+
+    summary = (
+        f"{METHOD_MARK[1]} שיטה 1 <i>(מושתקת)</i>: "
+        f"{stats['total_trades']} סגורות · {win_rate}% · {total_pnl} ש\"ח\n"
+        f"{_line(METHOD_MARK[2], 'שיטה 2', s2_done)}"
+        f"{_line(METHOD_MARK[3], 'שיטה 3', tf_done)}"
+    )
 
     send_telegram(
-        f"📊 <b>דוח יומי — {today}</b>\n\n"
+        f"📊 <b>דוח יומי — {today}</b> · v{BOT_VERSION}\n\n"
         f"{METHOD_MARK[1]} <b>שיטה 1 (מעקב בלבד) + התיק שלך:</b>\n"
         f"🔔 איתותים שנשלחו: {signals_today}\n"
         f"✅ עסקאות שנכנסת: {entered_today}\n"
@@ -3886,10 +4043,9 @@ def send_daily_report(data):
         f"{shadow_section}"
         f"{s2}"
         f"{s3}\n"
-        f"📈 סה\"כ עסקאות: {stats['total_trades']}\n"
-        f"✅ רווחים: {stats['wins']} | ❌ הפסדים: {stats['losses']}\n"
-        f"📊 אחוז הצלחה: {win_rate}%\n"
-        f"🏦 רווח/הפסד מצטבר: {total_pnl} ש\"ח"
+        f"📈 <b>מצטבר לפי שיטה</b>\n"
+        f"{summary}"
+        f"<i>שיטה 1 בסקאלה ישנה — לא לחבר בין השורות.</i>"
         f"{storage_note}"
     )
 
