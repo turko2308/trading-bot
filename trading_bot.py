@@ -77,7 +77,7 @@ DAILY_LOSS_LIMIT = None
 # Circuit breaker — אחרי כמה הפסדים רצופים ביום עוצרים איתותים חדשים
 CONSECUTIVE_LOSS_LIMIT = 3
 
-ACCOUNT_SIZE = 500
+ACCOUNT_SIZE = 650   # 22/08: הגודל האמיתי בפועל (היה 500 מיום ההקמה).
 RISK_PER_TRADE = 0.02   # לתצוגה/השוואה בלבד
 
 # ============================================================
@@ -1097,7 +1097,12 @@ def analyze_and_signal(symbol_name, symbol_code, data):
     if OLD_SIGNALS_WATCH_ONLY:
         # 3.5.0: הישנה נפסלה למסחר (מבחן עמידות 16/07) — נשארת כעיניים בלבד.
         # אין כפתורים ואין pending: אין דרך "להיכנס" עליה בטעות.
-        pending.pop(trade_id, None)
+        # 22/08: תוקן — data["pending"] כבר הוחלף באובייקט מסונן חדש בשורה
+        # 1071 (cutoff), אז pending.pop() המקורי מחק מ-dict ישן ולא באמת
+        # הסיר את הרשומה מ-data["pending"]. זו הסיבה שאיתותים ישנים בזמן
+        # שקט נשארו תקועים ב-pending בגיסט (נצפה בפועל 21-22/08: 2 רשומות
+        # שלא נמחקו יותר מ-24 שעות).
+        data["pending"].pop(trade_id, None)
         # 3.9.3: מצב שקט — הכל נרשם, כלום לא נשלח.
         if OLD_SIGNALS_SILENT:
             print(f"[S1-SILENT] {trade_num} {direction} @{entry_price} "
@@ -1871,6 +1876,31 @@ def _spread_points():
     per_pt = points_to_ils(1)
     return SPREAD_COST_ILS / per_pt if per_pt else 0.5
 
+def slow_units_state(trade, px):
+    """התמונה האמיתית של עסקת שיטה 2 במחיר נתון — על כל היחידות.
+
+    ‏22/08: תיקון תצוגה. כל ההודעות חישבו רווח/הפסד מ-trade["entry"]
+    (יחידה 1 בלבד), גם כשהיו שתי יחידות. יחידה 2 נכנסה בטריגר —
+    גבוה יותר בלונג — ולכן "כניסה+3" יכול להיות מינוס נטו.
+    כאן מחזירים כניסה ממוצעת ורווח ברוטו אמיתי (בלי מימון — הוא
+    תלוי-זמן ומחושב בנפרד בסגירה).
+
+    מחזיר: (n_units, avg_entry, gross_ils, is_profit)
+    """
+    is_long = trade.get("direction") == "קנייה"
+    units = trade.get("units") or [{"e": trade.get("entry")}]
+    entries = [u["e"] for u in units if u.get("e") is not None]
+    if not entries:
+        entries = [trade.get("entry")]
+    spread_pts = _spread_points()
+    gross = 0.0
+    for e in entries:
+        pu = (px - e) if is_long else (e - px)
+        gross += (pu - spread_pts) * REPORT_LOT_OZ * USD_ILS
+    avg_entry = sum(entries) / len(entries)
+    return len(entries), round(avg_entry, 2), round(gross, 2), gross > 0
+
+
 def _simulate_slow(h4, entry_days=10, trail_days=5, risk_ils=SLOW_RISK_ILS,
                    slippage_points=0.0, fixed_target_points=None,
                    pyramid_units=1, pyramid_step_n=0.5,
@@ -2376,6 +2406,20 @@ def tf_scan(data):
                 backup_line = ("⚠️ אין גיבוי 6H\n"
                                f"{backup_window_txt(now_il())}\n")
 
+        # 22/08: מדידת פער הכניסה (§4ט/§9) — הראיה היחידה שנחשבת היא
+        # הוראת לימיט אמיתית בדמו, לא סימולציה (כלל 17). מוסיף תזכורת
+        # ל-10 האיתותים הבאים בלבד, סופר ב-data["entry_gap_seq"], ואז
+        # שקט. לא נוגע בלוגיקת המסחר/הרישום — רק שורה בהודעה.
+        gap_n = data.get("entry_gap_seq", 0)
+        gap_line = ""
+        if gap_n < 10:
+            gap_line = (
+                f"\n🧪 <b>מדידת פער הכניסה ({gap_n + 1}/10)</b>\n"
+                f"פתח לימיט בדמו במחיר הכניסה בדיוק ({c:.2f}). תגיד לי מה קרה "
+                f"(התמלא/לא, באיזה מחיר, מתי) — אני רושם ב-entry_gap_log.md.\n"
+            )
+            data["entry_gap_seq"] = gap_n + 1
+
         msg = (
             f"{TF_SIGNAL_OPEN} · {fmt_sig_id(sig_id)}\n\n"
             f"{name} · <b>{direction}</b> · נר {now_il().strftime('%d/%m %H:%M')}\n\n"
@@ -2385,7 +2429,8 @@ def tf_scan(data):
             f"יעד    {target:.2f}   (+{abs(target-c):.1f}$)\n"
             f"ATR{TF_ATR_PERIOD}  {atr:.2f}$\n\n"
             f"{REPORT_LOT_OZ}oz · סיכון {risk_at_min_ils:.0f} ש\"ח\n"
-            f"<i>מעקב בלבד — לא למסחר.</i>\n"
+            f"<i>מעקב בלבד — לא למסחר אמיתי (חוץ מהלימיט למדידה למעלה).</i>\n"
+            f"{gap_line}"
             f"{TF_SIGNAL_CLOSE}"
         )
         send_telegram(msg)
@@ -2454,11 +2499,27 @@ def slow_scan_and_monitor(data):
                 if _improves:
                     _old = open_trade["stop"]
                     open_trade["stop"] = _be
+                    # 22/08: מה קורה *באמת* אם הסטופ הזה ייפגע — על כל היחידות.
+                    _n, _avg, _at_be, _prof = slow_units_state(open_trade, _be)
+                    if _n > 1:
+                        _truth = (
+                            f"⚠️ <b>שים לב — יש {_n} יחידות.</b>\n"
+                            f"כניסה ממוצעת: <b>{_avg}</b> (לא {open_trade['entry']}).\n"
+                            + (f"אם הסטופ ייפגע כאן: <b>{_at_be:+.2f} ש\"ח</b> — "
+                               f"עדיין ברווח."
+                               if _prof else
+                               f"אם הסטופ ייפגע כאן: <b>{_at_be:+.2f} ש\"ח</b> — "
+                               f"<b>זה מינוס, לא אפס.</b>")
+                        )
+                    else:
+                        _truth = (f"אם הסטופ ייפגע כאן: <b>{_at_be:+.2f} ש\"ח</b> "
+                                  f"(לפני מימון).")
                     send_telegram(
                         f"🔒 <b>ברייקאיבן — עסקה {fmt_tn(open_trade['number'])}</b>\n"
                         f"המחיר זז {_mfe:.1f}$ לטובתנו. הסטופ עלה לכניסה +{SLOW_BE_OFFSET:.0f}$.\n"
                         f"סטופ חדש: <b>{open_trade['stop']}</b> (היה {round(_old, 2)})\n"
-                        f"מכאן העסקה לא יכולה להפסיד. (עדכן גם בפלוס500)"
+                        f"{_truth}\n"
+                        f"(עדכן גם בפלוס500)"
                     )
                     print(f"[SLOW] ברייקאיבן: {_old} → {open_trade['stop']}", flush=True)
                 save_data(data)
@@ -2555,6 +2616,7 @@ def slow_scan_and_monitor(data):
                     f"👉 <b>פתח עכשיו פוזיציה שנייה: {SLOW_LOT_OZ} אונקיה, "
                     f"{'קנייה' if is_long else 'מכירה'}</b>\n"
                     f"🛑 סטופ לפוזיציה החדשה: <b>{open_trade['stop']}</b> — זהה לראשונה.\n"
+                    f"📊 כניסה ממוצעת מעכשיו: <b>{slow_units_state(open_trade, _atrg)[1]}</b>\n"
                     f"מעכשיו כל עדכון סטופ חל על <b>שתי</b> הפוזיציות בפלוס500."
                 )
                 print(f"[SLOW] פירמידינג: יחידה 2 @{_atrg}", flush=True)
@@ -2567,12 +2629,17 @@ def slow_scan_and_monitor(data):
         if tightened and abs(new_trail - old_trail) >= 1.0:
             open_trade["stop"] = round(new_trail, 2)
             save_data(data)
-            locked = (new_trail - open_trade["entry"]) if is_long else (open_trade["entry"] - new_trail)
+            # 22/08: "נעול רווח" נמדד על כל היחידות, לא רק על הראשונה.
+            _n, _avg, _locked_ils, _prof = slow_units_state(open_trade, new_trail)
+            locked = (new_trail - _avg) if is_long else (_avg - new_trail)
             send_telegram(
                 f"🔃 <b>סטופ נגרר עודכן — עסקה {fmt_tn(open_trade['number'])}</b>\n"
                 f"סטופ חדש: <b>{open_trade['stop']}</b> (היה {round(old_trail, 2)})\n"
                 f"מחיר נוכחי: {round(current_price, 2)} | "
-                + (f"🔒 נעול רווח: {points_to_ils(locked) and ''}{locked:+.1f} נק'" if locked > 0 else f"מרחק מהכניסה: {locked:+.1f} נק'") + "\n"
+                + (f"🔒 נעול: <b>{_locked_ils:+.2f} ש\"ח</b> ({locked:+.1f} נק' מהממוצע)"
+                   if _prof else
+                   f"אם ייפגע: <b>{_locked_ils:+.2f} ש\"ח</b> ({locked:+.1f} נק' מהממוצע)") + "\n"
+                + (f"({_n} יחידות, כניסה ממוצעת {_avg})\n" if _n > 1 else "")
                 + (f"(עדכן את הסטופ ב<b>שתי</b> הפוזיציות בפלוס500)"
                    if len(open_trade.get("units") or []) > 1
                    else f"(עדכן את הסטופ גם בפלוס500)")
@@ -3115,13 +3182,23 @@ def handle_callbacks(data, last_update_id):
                         data["daily_stats"][today] = {}
                     data["daily_stats"][today]["entered"] = data["daily_stats"][today].get("entered", 0) + 1
                     save_data(data)
-                    keyboard = [[{"text": "🔒 סגרתי עסקה", "callback_data": f"cl_{trade_id}"}]]
+                    # 22/08: כפתור תיקון מחיר כניסה. עד עכשיו trade["entry"]
+                    # תמיד = מחיר האיתות, גם כשהמילוי בפועל שונה (בדיוק כמו
+                    # הבאג שתוקן ליציאה ב-3.9.3 עם Close Rate — כאן זה מעולם
+                    # לא נסגר לכניסה). בלי זה, כל חישוב P&L לעסקה הזו סוטה
+                    # מהמציאות בגובה פער הכניסה (§4ט/§13.7).
+                    keyboard = [
+                        [{"text": "🔒 סגרתי עסקה", "callback_data": f"cl_{trade_id}"}],
+                        [{"text": "✏️ נכנסתי במחיר אחר", "callback_data": f"fe_{trade_id}"}]
+                    ]
                     send_telegram(
                         f"🐢 <b>עסקה {fmt_tn(num)} נפתחה — {signal['symbol']} (שיטה 2)</b>\n"
                         f"כיוון: {'קנייה 🟢' if signal['direction'] == 'קנייה' else 'מכירה 🔴'}\n"
                         f"כניסה: {signal['entry']} | סטופ נגרר: {signal['stop']}\n"
                         f"🎯 בלי טארגט — הבוט יזיז את הסטופ ויודיע. החזקה: ימים.\n"
-                        f"אין צורך לשבת מול המסך — כל שינוי יגיע בהתראה.",
+                        f"אין צורך לשבת מול המסך — כל שינוי יגיע בהתראה.\n"
+                        f"<i>נכנסת במחיר שונה מ-{signal['entry']}? לחץ ✏️ ותקן —"
+                        f" זה משפיע על הרווח/הפסד הסופי.</i>",
                         keyboard
                     )
                     print(f"[CALLBACK] 🐢 עסקת שיטה 2 {fmt_tn(num)} נפתחה", flush=True)
@@ -3195,6 +3272,24 @@ def handle_callbacks(data, last_update_id):
                     trade["ack"] = True
                     save_data(data)
                 send_telegram("👍 נרשם")
+
+            # ✏️ תיקון מחיר כניסה (22/08) — שיטה 2 בלבד
+            elif cbd.startswith("fe_"):
+                trade_id = cbd[3:]
+                trade = next((t for t in data["trades"]
+                             if t["id"] == trade_id and t["status"] == "open"), None)
+                if not trade:
+                    send_telegram("⚠️ לא נמצאה עסקה פתוחה")
+                    continue
+                trade["waiting_entry_px"] = True
+                save_data(data)
+                send_telegram(
+                    f"✏️ עסקה {fmt_tn(trade.get('number','?'))} — "
+                    f"שלח את מחיר הכניסה האמיתי (לדוגמה: 4575).\n"
+                    f"רשום כרגע: {trade.get('entry')}. "
+                    f"<i>מתקן רק את יחידה 1 — אם הוספת יחידה, תגיד לי בנפרד.</i>"
+                )
+                print(f"[CALLBACK] ✏️ עסקה {trade_id} — ממתין למחיר כניסה אמיתי", flush=True)
 
             # 🔒 סגרתי עסקה (תפריט סגירה ידני)
             elif cbd.startswith("cl_"):
@@ -3586,6 +3681,50 @@ def handle_callbacks(data, last_update_id):
                     )
                 except Exception as e:
                     send_telegram(f"🩺 חי, אבל שגיאה בהרכבת הסטטוס: {e}")
+                continue
+
+            # ── 22/08: מחיר כניסה אמיתי לעסקת שיטה 2 ──────────────────
+            # נבדק לפני waiting_close_px: אם שתי הדגלים פעילים (לא אמור
+            # לקרות בזרימה הרגילה), תיקון כניסה קודם לסגירה.
+            entry_px_trade = next((t for t in data["trades"]
+                                   if t.get("waiting_entry_px") and t["status"] == "open"), None)
+            if entry_px_trade:
+                try:
+                    real_entry = float(text.replace(",", "").strip())
+                except ValueError:
+                    send_telegram("⚠️ שלח מספר בלבד — למשל 4575")
+                    continue
+                if not (100.0 < real_entry < 100000.0):
+                    send_telegram("⚠️ המחיר לא נראה סביר לזהב. שלח שוב.")
+                    continue
+                old_entry = entry_px_trade.get("entry")
+                entry_px_trade["entry"] = real_entry
+                units = entry_px_trade.get("units")
+                if units:
+                    units[0]["e"] = real_entry
+                entry_px_trade["entry_source"] = "manual_plus500"
+                entry_px_trade.pop("waiting_entry_px", None)
+                is_long = entry_px_trade.get("direction") == "קנייה"
+                # 22/08: הטריגר לפירמידינג נגזר מהכניסה — אם הכניסה תוקנה,
+                # הוא חייב להיגזר מחדש. אחרת הוא נשאר תלוי במחיר האיתות,
+                # והבוט מריץ מרחק הוספה שונה מזה שנמדד בבקטסט (שם אין פער).
+                _trg_note = ""
+                _old_trg = entry_px_trade.get("add_trigger")
+                _natr = entry_px_trade.get("n_atr")
+                if _old_trg is not None and _natr:
+                    _step = SLOW_PYRAMID_STEP_N * _natr
+                    _new_trg = round(real_entry + _step if is_long else real_entry - _step, 2)
+                    entry_px_trade["add_trigger"] = _new_trg
+                    _trg_note = f"\n🪜 טריגר ההוספה עודכן: {_old_trg} → <b>{_new_trg}</b>"
+                save_data(data)
+                gap = (old_entry - real_entry) if is_long else (real_entry - old_entry)
+                send_telegram(
+                    f"✏️ עסקה {fmt_tn(entry_px_trade.get('number','?'))} — כניסה עודכנה: "
+                    f"{old_entry} → {real_entry}\n"
+                    f"פער מהאיתות: {gap:+.2f}$ ({'לטובתך' if gap > 0 else 'נגדך' if gap < 0 else 'זהה'})"
+                    f"{_trg_note}"
+                )
+                print(f"[SLOW] מחיר כניסה תוקן {old_entry} → {real_entry}", flush=True)
                 continue
 
             # ── 3.9.3: מחיר סגירה אמיתי לעסקת שיטה 2 ─────────────────
