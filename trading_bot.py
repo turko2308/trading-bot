@@ -211,7 +211,7 @@ def backup_window_txt(now):
 # סקאלת סיכון 40 ש"ח). רשומה ישנה וחדשה נראות זהות ואי אפשר להבדיל
 # ביניהן בדיעבד. הכלל "אל תערבב נתונים משתי סקאלות" תוחזק עד היום
 # לפי תאריך בלבד — עכשיו הוא נאכף בנתונים עצמם.
-BOT_VERSION = "3.9.5"
+BOT_VERSION = "3.9.6"
 PNL_SCALE = "0.75oz-net"        # מה שהשדה pnl מודד בגרסה הזו
 
 DATA_FILE = "/tmp/bot_data.json"
@@ -1983,8 +1983,19 @@ def _simulate_slow(h4, entry_days=10, trail_days=5, risk_ils=SLOW_RISK_ILS,
             pos["trail"] = min(pos["trail"], t_hi)
 
         # ברייקאיבן — הזרוע נדרכה בנר קודם; הסטופ מתהדק בלבד
+        #
+        # 3.9.6 (24/08): העוגן הוא היחידה ה*אחרונה*, לא הראשונה.
+        # היה כאן pos["entry"] — הכניסה של יחידה 1 בלבד. יחידה 2
+        # נכנסת בטריגר, ~0.5×ATR גבוה יותר, ולכן סטופ ב"כניסה 1 +3"
+        # יושב *מתחת* לכניסה השנייה: היא יוצאת בהפסד וההודעה אומרת
+        # "ברייקאיבן". נמדד ב-be_anchor.py על 2.5 שנים:
+        #   יחידה 1 (הישן): 33% הצלחה · 7,041 · 18/30 מפורמדות במינוס
+        #   יחידה אחרונה  : 73% הצלחה · 7,520 · 2/34  מפורמדות במינוס
+        # עובר גם ב-2$ וב-3$ החלקה (הסף לשיטה 2, §14.2).
+        # לא סותר §4י: זה *מרחיק* את הסטופ מהמחיר, לא מהדק אותו.
         if pos.get("be_hit"):
-            be_px = (pos["entry"] + be_offset) if pos["dir"] == "long" else (pos["entry"] - be_offset)
+            _anchor = pos["units"][-1]["e"] if pos.get("units") else pos["entry"]
+            be_px = (_anchor + be_offset) if pos["dir"] == "long" else (_anchor - be_offset)
             if pos["dir"] == "long":
                 pos["trail"] = max(pos["trail"], be_px)
             else:
@@ -2537,7 +2548,10 @@ def slow_scan_and_monitor(data):
         if SLOW_BE_TRIGGER is not None and not open_trade.get("be_hit"):
             _mfe = (current_price - open_trade["entry"]) if is_long else (open_trade["entry"] - current_price)
             if _mfe >= SLOW_BE_TRIGGER:
-                _be = round(open_trade["entry"] + SLOW_BE_OFFSET, 2) if is_long else round(open_trade["entry"] - SLOW_BE_OFFSET, 2)
+                # 3.9.6: עוגן = היחידה האחרונה. ר' ההסבר ב-_simulate_slow.
+                _u = open_trade.get("units") or [{"e": open_trade["entry"]}]
+                _anchor = _u[-1].get("e", open_trade["entry"])
+                _be = round(_anchor + SLOW_BE_OFFSET, 2) if is_long else round(_anchor - SLOW_BE_OFFSET, 2)
                 open_trade["be_hit"] = True
                 _improves = (is_long and _be > open_trade["stop"]) or ((not is_long) and _be < open_trade["stop"])
                 if _improves:
@@ -2545,6 +2559,8 @@ def slow_scan_and_monitor(data):
                     open_trade["stop"] = _be
                     # 22/08: מה קורה *באמת* אם הסטופ הזה ייפגע — על כל היחידות.
                     _n, _avg, _at_be, _prof = slow_units_state(open_trade, _be)
+                    _be_where = (f"כניסה +{SLOW_BE_OFFSET:.0f}$" if _n == 1
+                                 else f"<b>יחידה {_n} +{SLOW_BE_OFFSET:.0f}$</b> ({_anchor})")
                     if _n > 1:
                         _truth = (
                             f"⚠️ <b>שים לב — יש {_n} יחידות.</b>\n"
@@ -2560,7 +2576,7 @@ def slow_scan_and_monitor(data):
                                   f"(לפני מימון).")
                     send_telegram(
                         f"🔒 <b>ברייקאיבן — עסקה {fmt_tn(open_trade['number'])}</b>\n"
-                        f"המחיר זז {_mfe:.1f}$ לטובתנו. הסטופ עלה לכניסה +{SLOW_BE_OFFSET:.0f}$.\n"
+                        f"המחיר זז {_mfe:.1f}$ לטובתנו. הסטופ עלה ל{_be_where}.\n"
                         f"סטופ חדש: <b>{open_trade['stop']}</b> (היה {round(_old, 2)})\n"
                         f"{_truth}\n"
                         f"(עדכן גם בפלוס500)"
