@@ -211,7 +211,7 @@ def backup_window_txt(now):
 # סקאלת סיכון 40 ש"ח). רשומה ישנה וחדשה נראות זהות ואי אפשר להבדיל
 # ביניהן בדיעבד. הכלל "אל תערבב נתונים משתי סקאלות" תוחזק עד היום
 # לפי תאריך בלבד — עכשיו הוא נאכף בנתונים עצמם.
-BOT_VERSION = "3.9.4"
+BOT_VERSION = "3.9.5"
 PNL_SCALE = "0.75oz-net"        # מה שהשדה pnl מודד בגרסה הזו
 
 DATA_FILE = "/tmp/bot_data.json"
@@ -2193,8 +2193,42 @@ def tf_monitor(data, h1):
         target = sig["target"]
         is_long = sig.get("direction") == "קנייה"
 
-        # רק נרות שנסגרו אחרי נר האיתות
-        bars = [b for b in h1 if b["t"] > t0]
+        # ── 3.9.5 · באג הנר של האיתות (נמצא 24/08) ──────────────────
+        # היה כאן: bars = [b for b in h1 if b["t"] > t0]
+        # ‏t0 הוא זמן ה*פתיחה* של נר האיתות. נר 6H שנפתח ב-00:00 נסגר
+        # ב-06:00, ולכן התנאי הישן הכניס לבדיקה את השעות 01:00–05:00 —
+        # שעות שנמצאות *בתוך* נר האיתות, לפני שהאיתות בכלל נוצר.
+        #
+        # הכניסה נלקחת מסגירת הנר. הסטופ נבדק מול השפל של אותו נר.
+        # כלומר: נכנסים בשיא ויוצאים בשפל של אותו נר בדיוק.
+        # ככל שנר הפריצה חזק יותר — כך השפל רחוק יותר מהסגירה — כך
+        # גדל הסיכוי שהאיתות ייספר כהפסד מיידי. הבאג הרג בדיוק את
+        # האיתותים שהשיטה מחפשת.
+        #
+        # עסקה #024 (24/08): נר 03:00 · High 4640.37 = מחיר הכניסה,
+        # Low 4594.76 = מתחת לסטופ 4599.07. נסגרה 10 דקות אחרי
+        # שנפתחה, על מהלך שקרה שלוש שעות לפני שהאיתות נשלח. הנרות
+        # שאחרי האיתות (05:00 שפל 4627, 06:00 שפל 4633) לא התקרבו
+        # לסטופ, והמחיר המשיך ל-4647 — בדרך ליעד 4681.67.
+        #
+        # מעכשיו: רק נרות שמתחילים ב*סגירת* נר האיתות ואילך.
+        _tf_h = next((c["hours"] for c in TF_CONFIGS if c["name"] == sig.get("tf")), None)
+        if _tf_h is None:
+            sig["status"] = "void"
+            sig["result"] = "bad_tf"
+            changed = True
+            continue
+        t_close = t0 + datetime.timedelta(hours=_tf_h)
+        # חגורה ושלייקס: גם לא לפני הרגע שהאיתות נשלח בפועל.
+        # sig["time"] הוא tz-aware (now_il), ונרות h1 הם naive בשעון
+        # ישראל — השוואה ישירה זורקת TypeError. מסירים tzinfo.
+        try:
+            t_sent = datetime.datetime.fromisoformat(sig["time"]).replace(tzinfo=None)
+            if t_sent > t_close:
+                t_close = t_sent
+        except (KeyError, ValueError, TypeError):
+            pass
+        bars = [b for b in h1 if b["t"] >= t_close]
         if not bars:
             continue
         # 3.9.3: ההיסטוריה מוגבלת ל-800 נרות שעתיים (~33 יום). רשומה
@@ -2357,6 +2391,10 @@ def tf_scan(data):
             "max_oz": round(max_oz, 3),
             "risk_at_min_ils": round(risk_at_min_ils, 1),
             "backup": bool(backup) if name == "4H" else None,
+            # 3.9.5: חותמת מנוע. רשומות מלפני 3.9.5 נוצרו עם באג נר
+            # האיתות (ראה tf_monitor) ואינן בנות-השוואה לרשומות שאחריו.
+            # אותה מדיניות כמו פיצול הגיסט ב-3.9.0.
+            "engine": BOT_VERSION,
             "time": now_il().isoformat(), "status": "open"
         })
 
@@ -2422,7 +2460,13 @@ def tf_scan(data):
 
         msg = (
             f"{TF_SIGNAL_OPEN} · {fmt_sig_id(sig_id)}\n\n"
-            f"{name} · <b>{direction}</b> · נר {now_il().strftime('%d/%m %H:%M')}\n\n"
+            # 3.9.5: היה כאן now_il() — כלומר השעה הנוכחית, לא הנר.
+            # זה הסתיר את באג נר האיתות: הודעת הפתיחה תמיד הציגה שעה
+            # שתאמה לרגע הקבלה, ולכן נראתה תקינה. הודעת הסגירה הציגה
+            # את הנר האמיתי (זמן פתיחה), ורק ההשוואה ביניהן חשפה
+            # שהעסקה נסגרה לפני שהאיתות בכלל נשלח.
+            f"{name} · <b>{direction}</b> · נר {last['t'].strftime('%d/%m %H:%M')}"
+            f"–{(last['t'] + datetime.timedelta(hours=hrs)).strftime('%H:%M')}\n\n"
             f"{backup_line}\n"
             f"כניסה  <b>{c:.2f}</b>\n"
             f"סטופ   {stop:.2f}   ({-risk_usd:.1f}$)\n"
