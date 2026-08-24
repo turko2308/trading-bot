@@ -43,10 +43,25 @@ idx=sorted(range(len(m15)), key=lambda i:m15[i]["t"])
 times=[m15[i]["t"] for i in idx]
 import bisect
 def resolve(s, slip):
+    # ── תיקון 24/08: באג נר האיתות ──────────────────────────────
+    # היה כאן: j = bisect.bisect_right(times, s["t"])
+    # ‏s["t"] הוא זמן ה*פתיחה* של הנר (build() ממפתח לפי hour//h*h),
+    # אבל הכניסה ent נלקחת מ-s["e"] = ה*סגירה*. כלומר הסריקה התחילה
+    # מנרות m15 שנמצאים *בתוך* נר האיתות — נכנסים בסגירה, בודקים
+    # סטופ מהפתיחה. ככל שהנר רחב יותר כך גדל הסיכוי להפסד מדומה.
+    #
+    # זה משמעותי במיוחד כאן: הכלי הזה הפיק את §4כ (נר 12:00 מפסיד,
+    # p=0.0090) ואת דחיית 24 השעות. נר 12:00 הוא פתיחת חפיפת
+    # לונדון-ניו-יורק — הנר הרחב ביותר ביום — ולכן הנפגע העיקרי
+    # מהבאג. הממצא חייב הרצה מחדש לפני שמסיקים ממנו משהו.
+    #
+    # tf_offset.py ו-overlap.py תמיד עשו את זה נכון
+    # (start = s["t"] + tf_hours). הפער הזה הוא שחשף את הבאג בחי.
     ent = s["e"] + slip*s["d"]
     tp = ent + 2*s["atr"]*s["d"]
     sl = ent - 2*s["atr"]*s["d"]
-    j = bisect.bisect_right(times, s["t"])
+    tf_h = 4 if s["tf"] == "4H" else 6
+    j = bisect.bisect_left(times, s["t"] + datetime.timedelta(hours=tf_h))
     for k in range(j, len(m15)):
         b=m15[k]
         if s["d"]==1:
