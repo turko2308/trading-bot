@@ -211,7 +211,7 @@ def backup_window_txt(now):
 # סקאלת סיכון 40 ש"ח). רשומה ישנה וחדשה נראות זהות ואי אפשר להבדיל
 # ביניהן בדיעבד. הכלל "אל תערבב נתונים משתי סקאלות" תוחזק עד היום
 # לפי תאריך בלבד — עכשיו הוא נאכף בנתונים עצמם.
-BOT_VERSION = "3.9.7"
+BOT_VERSION = "3.9.8"
 PNL_SCALE = "0.75oz-net"        # מה שהשדה pnl מודד בגרסה הזו
 
 DATA_FILE = "/tmp/bot_data.json"
@@ -2150,6 +2150,23 @@ TF_TARGET_ATR = 2.0        # יעד = 2×ATR
 # רק סימון באיתות, כי שיטה 3 היא מעקב בלבד.
 TF_BACKUP_WINDOW_H = 4     # עד כמה שעות אחרי האיתות מקבלים גיבוי
 TF_BACKUP_LOOKBACK_H = 6   # וכמה אחורה נחשב "גיבוי קיים" (נר 6H אחד)
+
+
+def _scan_slot(now, interval, offset):
+    """3.9.8 (§21.8): מפתח חלון סריקה מיושר לשעון — XX:00:45, XX:10:45 וכו'.
+
+    הרשת הישנה נמדדה מרגע עליית התהליך, ולכן איתות יכול היה להתעכב עד
+    ~10 דקות בעקביות (תלוי במתי היה הדיפלוי האחרון). כאן החלונות קבועים
+    בשעון עצמו, כך שסגירת נר 4H/6H (00/04/06/08/12/16/18/20) נתפסת תמיד
+    בתוך `offset` שניות.
+
+    מחזיר None אם עוד מוקדם מדי בתוך החלון (הנר טרם זמין אצל הספק).
+    """
+    secs_into_hour = now.minute * 60 + now.second
+    slot_idx = secs_into_hour // interval
+    if secs_into_hour - slot_idx * interval < offset:
+        return None
+    return f"{now:%Y-%m-%d %H}-{slot_idx}"
 
 
 def _tf_aggregate(h1_bars, hours):
@@ -4304,8 +4321,11 @@ def main():
     scan_count = 0
 
     SCAN_INTERVAL = 600   # 10 דקות בין סריקות שוק
+    SCAN_OFFSET_S = 45    # 3.9.8 (§21.8): שניות אחרי גבול החלון — המתנה
+                          # לזמינות הנר אצל ספק הנתונים. אם הנר עוד לא שם,
+                          # הסריקה פשוט לא תמצא נר חדש והבאה תתפוס אותו.
     POLL_INTERVAL = 2     # תדירות בדיקת כפתורים (שניות)
-    last_scan_time = 0
+    last_scan_slot = None
 
     while True:
         try:
@@ -4314,9 +4334,10 @@ def main():
             # --- בדיקת כפתורים (תכופה → תגובה מיידית) ---
             last_update_id = handle_callbacks(data, last_update_id)
 
-            # --- סריקת שוק + מעקב עסקאות: כל 10 דקות ---
-            if time.time() - last_scan_time >= SCAN_INTERVAL:
-                last_scan_time = time.time()
+            # --- סריקת שוק + מעקב עסקאות: רשת מיושרת-שעון, כל 10 דקות ---
+            _slot = _scan_slot(now, SCAN_INTERVAL, SCAN_OFFSET_S)
+            if _slot and _slot != last_scan_slot:
+                last_scan_slot = _slot
                 scan_count += 1
                 _runtime["last_scan"] = now
                 print(f"\n--- סריקה #{scan_count} {now.strftime('%H:%M:%S')} ---", flush=True)
