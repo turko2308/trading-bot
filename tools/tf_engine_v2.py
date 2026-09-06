@@ -120,11 +120,17 @@ def tag_backup(sig_4h, sig_6h):
     when the 6H signal later arrives) collapsed into one offline pass
     since we have full hindsight here -- net effect on which signals
     end up backed is the same as the live two-message flow."""
+    # תיקון 06/09: t0 הוא זמן *פתיחת* הנר, אבל האיתות נורה בזמן
+    # *סגירה* (4H: t0+4h, 6H: u0+6h). ההשוואה הקודמת עשתה
+    # t0 מול u0 — פתיחה מול פתיחה — כלומר הזיזה את החלון ב-2 שעות
+    # מול הבוט החי, שמשווה זמני ירי. 5 איתותים סווגו הפוך.
     for s in sig_4h:
-        window_start = s["t0"] - datetime.timedelta(hours=TF_BACKUP_LOOKBACK_H)
-        window_end = s["t0"] + datetime.timedelta(hours=TF_BACKUP_WINDOW_H)
+        fire = s["t0"] + datetime.timedelta(hours=4)
+        window_start = fire - datetime.timedelta(hours=TF_BACKUP_LOOKBACK_H)
+        window_end = fire + datetime.timedelta(hours=TF_BACKUP_WINDOW_H)
         s["backup"] = any(
-            b["direction"] == s["direction"] and window_start <= b["t0"] <= window_end
+            b["direction"] == s["direction"]
+            and window_start <= (b["t0"] + datetime.timedelta(hours=6)) <= window_end
             for b in sig_6h
         )
     return sig_4h
