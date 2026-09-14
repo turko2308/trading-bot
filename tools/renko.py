@@ -22,7 +22,7 @@ tools/renko.py — Renko/Range-bar trend-follow — לא תלוי בזמן, מס
 שנקבעו היום — לא אישור לבנייה, רק סף כניסה למחקר נוסף (בדיוק כמו שכל שיטה 3 עברה
 לפני שהפכה לחיה).
 
-הרצה: python tools/renko.py   (מצפה ל-xauusd_h1_3y.csv או קובץ H1 דומה)
+הרצה: python tools/renko.py   (מצפה ל-data/xauusd_h1.csv (יחסית לריפו, תואם למוסכמה הקיימת))
 """
 import csv, datetime
 import numpy as np
@@ -82,7 +82,7 @@ def renko_backtest(closes, times, box_size=10, confirm_bricks=3, target_bricks=6
 
 if __name__ == "__main__":
     import sys
-    path = sys.argv[1] if len(sys.argv) > 1 else "xauusd_h1_3y.csv"
+    path = sys.argv[1] if len(sys.argv) > 1 else "../data/xauusd_h1.csv"
     h1 = load_h1(path)
     closes = [b["c"] for b in h1]; times = [b["t"] for b in h1]
     print(f"נטען: {len(h1)} נרות H1, {times[0]} עד {times[-1]}\n")
