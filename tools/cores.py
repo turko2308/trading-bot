@@ -12,7 +12,7 @@ Core A דו-כיווני: פריצת 20-נר + כיוון EMA50 (קנייה: clo
 
 אומת מול bot_data.json האמיתי (tf_signals) — ראה validate_against_live() בתחתית.
 
-הרצה: python tools/cores.py   (מצפה ל-xauusd_h1_3y.csv או xauusd_h1.csv)
+הרצה: python tools/cores.py   (מצפה ל-data/xauusd_h1.csv (יחסית לריפו))
 """
 import csv, datetime
 from zoneinfo import ZoneInfo
@@ -119,7 +119,7 @@ def validate_against_live(bars_4h, bars_6h, live_json_path):
 
 if __name__ == "__main__":
     import sys
-    path = sys.argv[1] if len(sys.argv) > 1 else "xauusd_h1_3y.csv"
+    path = sys.argv[1] if len(sys.argv) > 1 else "../data/xauusd_h1.csv"
     h1 = load_h1(path)
     print(f"נטען: {len(h1)} נרות H1 (IL time), {h1[0]['t']} עד {h1[-1]['t']}\n")
     h4 = aggregate(h1, 4); h6 = aggregate(h1, 6)
