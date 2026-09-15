@@ -154,6 +154,30 @@ def sig_close(system):
 TF_SIGNAL_OPEN = sig_open(3)
 TF_SIGNAL_CLOSE = sig_close(3)
 
+# ── 3.10.0: שיטה 1 חדשה — Renko קופסה-קטנה (מעקב בלבד) ────────
+# הליבה הישנה של שיטה 1 (EMA50+RSI/Bollinger) נסגרה סופית 14/09/2026:
+# נבדקה שוב על דאטה עדכני (כולל אוג-ספט 2026) וביציאה יחסית-ל-ATR,
+# ב-4 רמות הרפיה — 24/172/192/800 עסקאות, כולן 37-41% הצלחה, כולן שליליות.
+# במקומה: Renko. לא אינדיקטור אחר — מנגנון אחר. נר חדש נפתח רק כשהמחיר
+# זז RENKO_BOX דולר, בלי תלות בזמן, כך שתנודה קטנה מהקופסה לא מייצרת
+# יציאה מוקדמת (הכשל שחזר בכל וריאציה של שיטה 1).
+# בקטסט tools/renko_scalp.py, 3 שנים (14/9/2023-14/9/2026), נרות H1:
+#   N=4,507 · 68.4% הצלחה · +33,129$ · ~4.1 עסקאות/יום
+#   עמיד עד 5$/עסקה עלות (+10,594$) · Bootstrap P(רווח)=100%
+#   Monte Carlo DD: חציון -60$, גרוע -120$ → יחס DD:רווח ≈ 1:276
+#   7/7 חצאי-שנה חיוביים; 2026-H1 (שהרג כל שיטה אחרת) = התורם הגדול ביותר
+#   חפיפה מול שיטה 2 בפועל: 0.0% · מול שיטה 3 בפועל: 0.0% → עצמאי לחלוטין
+# פערים ידועים שטרם נסגרו: selection bias (5 שילובי פרמטרים, נבחר הטוב),
+# ואין CPCV/walk-forward (tools/cpcv.py לא קיים). לכן — מעקב בלבד.
+RENKO_LIVE      = False   # מעקב בלבד. True רק אחרי שהמעקב יצדיק זאת.
+RENKO_BOX       = 3.0     # גודל קופסה בדולרים
+RENKO_CONFIRM   = 2       # לבנים רצופות באותו כיוון = כניסה
+RENKO_TARGET    = 6       # יעד, בקופסאות
+RENKO_STOP      = 3       # סטופ, בקופסאות (יחס 2:1)
+RENKO_MAX_HOLD  = 6       # מקסימום לבנים בפוזיציה לפני יציאה בשוק
+RENKO_SIGNAL_OPEN  = sig_open(1)
+RENKO_SIGNAL_CLOSE = sig_close(1)
+
 
 # ── 3.9.4 · תיקון 4: מספור איתותים ────────────────────────────
 # מונה מתמיד ב-data ולא אינדקס במערך: tf_scan קורא log[-40:], וכשהיומן
@@ -331,7 +355,12 @@ def default_data():
             "losses": 0,
             "total_pnl": 0,
             "early_exits": 0
-        }
+        },
+        # 3.10.0: שיטה 1 (Renko) — מפתחות נפרדים לגמרי, כמו ששיטה 2
+        # (slow_state/slow_shadow) ושיטה 3 (tf_state/tf_signals) נפרדות.
+        "renko_state": {},
+        "renko_signals": [],
+        "renko_seq": 0
     }
 
 def _merge_defaults(data):
@@ -2346,12 +2375,160 @@ def tf_monitor(data, h1):
     return changed
 
 
+def renko_signal_id(data):
+    """מספר רץ לאיתות שיטה 1, מונה מתמיד ב-data (לא אינדקס במערך)."""
+    seq = int(data.get("renko_seq", 0)) + 1
+    data["renko_seq"] = seq
+    return seq
+
+
+def _renko_new_bricks(state, closes):
+    """מייצר לבנים חדשות מרשימת סגירות, ומעדכן את מחיר הייחוס בסטייט.
+    מחזיר רשימת (כיוון, מחיר_סגירת_לבנה). ייחוס None = אתחול ראשוני."""
+    out = []
+    ref = state.get("ref")
+    if ref is None and closes:
+        state["ref"] = closes[0]
+        ref = closes[0]
+    for c in closes:
+        while c - ref >= RENKO_BOX:
+            ref += RENKO_BOX
+            out.append((1, ref))
+        while ref - c >= RENKO_BOX:
+            ref -= RENKO_BOX
+            out.append((-1, ref))
+    state["ref"] = ref
+    return out
+
+
+def renko_scan(data, h1):
+    """שיטה 1 — Renko קופסה-קטנה. מעקב בלבד (RENKO_LIVE=False).
+
+    משתמש בנרות ה-H1 ש-tf_scan כבר משך — אפס קריאות API נוספות.
+    נבדק (tools/renko_scalp.py): קירוב מרזולוציה גסה שומר ~93% מהרווח
+    ואף מעלה את אחוז ההצלחה, כי הוא מסנן רעש תוך-שעתי.
+    """
+    if not h1 or len(h1) < 50:
+        return
+
+    state = data.setdefault("renko_state", {})
+    log = data.setdefault("renko_signals", [])
+    now = now_il().replace(tzinfo=None)
+
+    # רק נרות שנסגרו — הנר האחרון עדיין נבנה
+    closed = [b for b in h1 if b["t"] + datetime.timedelta(hours=1) <= now]
+    if len(closed) < 50:
+        return
+
+    last_seen = state.get("last_bar")
+    if last_seen is None:
+        # אתחול חד-פעמי: בונים ייחוס וכיוונים מההיסטוריה בלי לשדר איתותים
+        _renko_new_bricks(state, [b["c"] for b in closed])
+        state["dirs"] = []
+        state["last_bar"] = closed[-1]["t"].isoformat()
+        state["pos"] = None
+        print(f"[RENKO] אתחול — ייחוס {state['ref']:.2f}", flush=True)
+        return
+
+    fresh = [b for b in closed if b["t"].isoformat() > last_seen]
+    if not fresh:
+        return
+    state["last_bar"] = closed[-1]["t"].isoformat()
+
+    bricks = _renko_new_bricks(state, [b["c"] for b in fresh])
+    if not bricks:
+        return
+
+    dirs = state.get("dirs") or []
+    pos = state.get("pos")
+    changed = False
+
+    for bdir, bpx in bricks:
+        dirs.append(bdir)
+        dirs = dirs[-10:]
+
+        # ── פוזיציה פתוחה: בודקים יציאה לפני כניסה חדשה ──
+        if pos:
+            pos["held"] = pos.get("held", 0) + 1
+            reason = None
+            if pos["dir"] == 1:
+                if bpx <= pos["stop"]:   reason = "סטופ"
+                elif bpx >= pos["target"]: reason = "יעד"
+            else:
+                if bpx >= pos["stop"]:   reason = "סטופ"
+                elif bpx <= pos["target"]: reason = "יעד"
+            if reason is None and pos["held"] >= RENKO_MAX_HOLD:
+                reason = "תפוגה"
+            if reason:
+                pnl_pts = (bpx - pos["entry"]) if pos["dir"] == 1 else (pos["entry"] - bpx)
+                pnl_ils = points_to_ils(pnl_pts) * (1 if pnl_pts >= 0 else -1)
+                icon = "✅" if pnl_pts > 0 else ("➖" if reason == "תפוגה" else "🛑")
+                for rec in reversed(log):
+                    if rec.get("status") == "open":
+                        rec.update(status="closed", exit=round(bpx, 2), reason=reason,
+                                   pnl=round(pnl_pts, 2), close_time=now.isoformat())
+                        break
+                closed_recs = [r for r in log if r.get("status") == "closed"]
+                wins = sum(1 for r in closed_recs if (r.get("pnl") or 0) > 0)
+                tot = sum(r.get("pnl") or 0 for r in closed_recs)
+                send_telegram(
+                    f"{METHOD_MARK[1]} <b>עסקה שיטה 1 #{pos['id']} — {reason}</b>\n"
+                    f"{'קנייה' if pos['dir']==1 else 'מכירה'} · Renko {RENKO_BOX}$\n"
+                    f"כניסה {pos['entry']:.2f} → יציאה {bpx:.2f}  "
+                    f"({pnl_pts:+.2f}$)  {icon}\n"
+                    f"<b>{pnl_ils:+.2f} ש\"ח</b> ({POSITION_SIZE_OZ}oz) · "
+                    f"{pos['held']} לבנים\n\n"
+                    f"מצטבר שיטה 1: {len(closed_recs)} סגורות · "
+                    f"{(100*wins/len(closed_recs) if closed_recs else 0):.0f}% · "
+                    f"{tot:+.2f}$\n"
+                    f"{RENKO_SIGNAL_CLOSE}"
+                )
+                pos = None
+                changed = True
+
+        # ── אין פוזיציה: בודקים כניסה ──
+        if not pos and len(dirs) >= RENKO_CONFIRM:
+            recent = dirs[-RENKO_CONFIRM:]
+            if all(d == 1 for d in recent) or all(d == -1 for d in recent):
+                d = recent[0]
+                entry = bpx
+                stop = entry - RENKO_STOP * RENKO_BOX if d == 1 else entry + RENKO_STOP * RENKO_BOX
+                target = entry + RENKO_TARGET * RENKO_BOX if d == 1 else entry - RENKO_TARGET * RENKO_BOX
+                sid = renko_signal_id(data)
+                pos = {"id": sid, "dir": d, "entry": entry, "stop": stop,
+                       "target": target, "held": 0, "opened": now.isoformat()}
+                log.append({"id": sid, "time": now.isoformat(), "status": "open",
+                            "direction": "קנייה" if d == 1 else "מכירה",
+                            "entry": round(entry, 2), "stop": round(stop, 2),
+                            "target": round(target, 2), "box": RENKO_BOX})
+                send_telegram(
+                    f"{RENKO_SIGNAL_OPEN}\n"
+                    f"<b>{'קנייה' if d==1 else 'מכירה'}</b> · Renko {RENKO_BOX}$ · "
+                    f"{RENKO_CONFIRM} לבנים רצופות · #{sid}\n\n"
+                    f"כניסה  <b>{entry:.2f}</b>\n"
+                    f"סטופ   {stop:.2f}   ({-RENKO_STOP*RENKO_BOX:+.1f}$)\n"
+                    f"יעד    {target:.2f}   ({RENKO_TARGET*RENKO_BOX:+.1f}$)\n"
+                    f"סיכון {points_to_ils(RENKO_STOP*RENKO_BOX):.0f} ש\"ח · {POSITION_SIZE_OZ}oz\n\n"
+                    f"<i>מעקב בלבד — לא למסחר אמיתי. נבנה להחלפת שיטה 1 הישנה; "
+                    f"נאסף מדגם חי לפני החלטה.</i>\n"
+                    f"{RENKO_SIGNAL_CLOSE}"
+                )
+                changed = True
+
+    state["dirs"] = dirs
+    state["pos"] = pos
+    if len(log) > 400:
+        data["renko_signals"] = log[-400:]
+    if changed:
+        save_data(data)
+
+
 def tf_scan(data):
     """סורק 4H ו-6H. מעקב בלבד — בלי כפתורים, בלי כסף."""
     symbol = list(SYMBOLS.values())[0]
     h1 = _fetch_history(symbol, "1h", 800)
     if not h1 or len(h1) < 400:
-        return
+        return None
 
     # 3.9.4 · תיקון 4: מילוי מספרים לרשומות ותיקות, חד-פעמי.
     tf_filled = tf_backfill_ids(data)
@@ -2529,6 +2706,8 @@ def tf_scan(data):
 
     if changed or tf_closed_any or tf_filled:
         save_data(data)
+
+    return h1
 
 
 def slow_scan_and_monitor(data):
@@ -4360,9 +4539,17 @@ def main():
                     try:
                         slow_scan_and_monitor(data)
                         try:
-                            tf_scan(data)          # שיטה 3 — 4H + 6H, מעקב בלבד
+                            _h1 = tf_scan(data)    # שיטה 3 — 6H, מעקב בלבד
                         except Exception as _e:
+                            _h1 = None
                             print(f"[TF] שגיאה: {_e}", flush=True)
+                        # 3.10.0: שיטה 1 (Renko) — משתמשת באותם נרות H1
+                        # ש-tf_scan כבר משך. אפס קריאות API נוספות.
+                        try:
+                            if _h1:
+                                renko_scan(data, _h1)
+                        except Exception as _e:
+                            print(f"[RENKO] שגיאה: {_e}", flush=True)
                     except Exception as e:
                         print(f"[SLOW] שגיאה: {e}", flush=True)
 
