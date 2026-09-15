@@ -77,7 +77,18 @@ DAILY_LOSS_LIMIT = None
 # Circuit breaker — אחרי כמה הפסדים רצופים ביום עוצרים איתותים חדשים
 CONSECUTIVE_LOSS_LIMIT = 3
 
-ACCOUNT_SIZE = 650   # 22/08: הגודל האמיתי בפועל (היה 500 מיום ההקמה).
+# 15/09/2026: הפך למשתנה סביבה. הרקע — הודעת פירמידינג הציגה "299 ש"ח (46%
+# מהחשבון)" בעוד שחשבון הדמו בפועל עומד על ~213,000 ש"ח, כלומר התצוגה שגתה
+# בשלושה סדרי גודל. המספר לא הוקשח ל-213,000 בכוונה: זו יתרת דמו (כסף
+# פיקטיבי), והזנתה תגרום לבוט להמליץ על גדלי פוזיציה שמתאימים להון שלא קיים.
+# לעדכון: משתנה ACCOUNT_SIZE בלוח הבקרה של Render. ברירת המחדל לא משתנה.
+try:
+    ACCOUNT_SIZE = float(os.environ.get("ACCOUNT_SIZE", "650"))
+    if ACCOUNT_SIZE <= 0:
+        raise ValueError
+except (ValueError, TypeError):
+    print("[CONF] ACCOUNT_SIZE לא תקין — נופל לברירת מחדל 650", flush=True)
+    ACCOUNT_SIZE = 650.0
 RISK_PER_TRADE = 0.02   # לתצוגה/השוואה בלבד
 
 # ============================================================
@@ -1116,7 +1127,7 @@ def analyze_and_signal(symbol_name, symbol_code, data):
         f"🛑 סטופ: <b>{stop}</b>\n"
         f"🎯 טארגט 1: <b>{target1}</b> (סוגר הכל)\n"
         f"🎯 טארגט 2: <b>{target2}</b> (מידע)\n"
-        f"💸 סיכון: {risk_amount} ש\"ח ({risk_pct}% מהחשבון)\n"
+        f"💸 סיכון: {risk_amount} ש\"ח ({risk_pct}% מחשבון {ACCOUNT_SIZE:,.0f})\n"
         f"━━━━━━━━━━━━━━━\n"
         f"{trend_line}"
         f"🔍 " + " | ".join(signals) + "\n"
@@ -3000,7 +3011,7 @@ def slow_scan_and_monitor(data):
         + (f"🪜 טריגר להוספה (יחידה 2, {SLOW_LOT_OZ} אונקיה): נר 4ש' נסגר "
            f"{'מעל' if is_long else 'מתחת'} <b>{add_trigger}</b> — תישלח התראה\n"
            if add_trigger else "")
-        + f"💸 <b>הסיכון האמיתי: {risk_real:.0f} ש\"ח</b> ({risk_pct:.0f}% מהחשבון) "
+        + f"💸 <b>הסיכון האמיתי: {risk_real:.0f} ש\"ח</b> ({risk_pct:.0f}% מחשבון {ACCOUNT_SIZE:,.0f}) "
         f"— {REPORT_LOT_OZ}oz × {stop_pts:.1f}$ + ספרד\n"
         f"💸 מימון לילה: {FUNDING_ILS_PER_OZ_DAY * SLOW_LOT_OZ:.2f} ש\"ח ליום "
         f"ליחידה (נמדד)\n"
