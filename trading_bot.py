@@ -217,6 +217,11 @@ M4_STOP_MULT     = 1.0     # סטופ = טווח × זה
 M4_RENKO_BOX     = 20.0
 M4_RENKO_CONFIRM = 2
 M4_VOL_MULT      = 0.0     # 0 = מסנן נפח כבוי. ר' ההערה למעלה.
+# 19/09: תוקן אחרי איתות שגוי בשבת — טווח של 0.3$ (רעש של שוק סגור) נחשב
+# כפריצה. סף מינימלי: הספרד הוא 0.77$, ולכן טווח קטן מ-5$ הופך את העסקה
+# למפסידה-בוודאות גם כשהיעד נפגע. 5$ נבחר כרף בטיחות בסיסי (הטווח הממוצע
+# בבקטסט היה ~19$, כך שזה חוסם רעש בלבד ולא עסקאות אמיתיות).
+M4_MIN_RANGE     = 5.0
 M4_SIGNAL_OPEN   = sig_open(4)
 M4_SIGNAL_CLOSE  = sig_close(4)
 IL_TZ  = ZoneInfo("Asia/Jerusalem")
@@ -2478,6 +2483,10 @@ def m4_scan(data, h1):
     """
     if not M4_ENABLED or not h1 or len(h1) < 60:
         return
+    # 19/09: שיטה 4 חייבת את אותה בדיקת שעות-מסחר כמו שאר השיטות. בלעדיה
+    # היא רצה בסופ"ש על מחיר קפוא ומייצרת "פריצות" של רעש.
+    if not is_trading_hours(list(SYMBOLS.keys())[0]):
+        return
 
     state = data.setdefault("m4_state", {})
     log = data.setdefault("m4_signals", [])
@@ -2547,7 +2556,7 @@ def m4_scan(data, h1):
             and len(closed) > M4_RANGE_BARS + 1):
         w = closed[-(M4_RANGE_BARS + 1):-1]      # הנרות שלפני הנוכחי
         hi = max(b["h"] for b in w); lo = min(b["l"] for b in w); R = hi - lo
-        if R > 0:
+        if R > M4_MIN_RANGE:
             d = None
             if bar["h"] > hi: d = 1
             elif bar["l"] < lo: d = -1
