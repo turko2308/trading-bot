@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import hashlib
+from zoneinfo import ZoneInfo
 
 try:
     from zoneinfo import ZoneInfo
@@ -151,8 +152,8 @@ SPREAD_COST_ILS = round(POSITION_SIZE_OZ * SPREAD_POINTS * USD_ILS, 2)
 # ── 3.9.1: סימון אחיד להודעות טלגרם ────────────────────────────
 # ריבוע צבעוני לפי שיטה + גבול ברור לתחילת וסוף איתות, כדי שאפשר יהיה
 # להבחין בין שיטות ובין איתות להודעת שירות במבט אחד בפיד.
-METHOD_MARK = {1: "🟥", 2: "🟩", 3: "🟧"}
-METHOD_NAME = {1: "שיטה 1", 2: "שיטה 2", 3: "שיטה 3"}
+METHOD_MARK = {1: "🟥", 2: "🟩", 3: "🟧", 4: "🟦"}
+METHOD_NAME = {1: "שיטה 1", 2: "שיטה 2", 3: "שיטה 3", 4: "שיטה 4"}
 
 def sig_open(system):
     m = METHOD_MARK.get(system, "⬜")
@@ -182,6 +183,44 @@ TF_SIGNAL_CLOSE = sig_close(3)
 # ואין CPCV/walk-forward (tools/cpcv.py לא קיים). לכן — מעקב בלבד.
 RENKO_LIVE      = False   # מעקב בלבד. True רק אחרי שהמעקב יצדיק זאת.
 RENKO_BOX       = 3.0     # גודל קופסה בדולרים
+
+# ══ 3.11.0: שיטה 4 — פריצת טווח מתגלגל מסוננת ב-Renko ══════════════════
+# מקור: חיפוש מבנה-זמן אחרי ששיטה 1 נסגרה במדידה (כל גרסה תוך-יומית נמדדה
+# כזהה לאקראי — DECISIONS §31). הרעיון של סינון Renko הוא של איזק:
+# "Renko לא טועה בכיוון, הכניסות דפוקות". הנתונים אישרו זאת חד-משמעית.
+#
+# המנגנון: בכל שעה מחשבים את הטווח של 2 השעות הקודמות. פריצת גבול הטווח
+# בחלון 07:00-20:00 UTC = איתות — אך ורק אם Renko (קופסה 20$, 2 לבנים)
+# מסכים עם כיוון הפריצה. יעד = סטופ = גודל הטווח. אופק 4 שעות.
+#
+# אימות (tools/, נתוני M15 2024-07/2026):
+#   בר-ביצוע:    כניסה בגבול הטווח, יציאה מול high/low ברזולוציית M15 ✅
+#   אקראיות:     כיוון p=0.000 · Renko מעורבל p=0.000 ✅
+#   בלי Renko:   -1.3 ש"ח לעסקה ⇒ הסינון הוא כל האפקט, לא שיפור
+#   plateau:     36/36 וריאציות חיוביות (+3.85$ עד +7.75$)
+#   Bootstrap:   100% · DD:רווח 1:8.8 · 3/3 שנים
+#   PBO = 0.214  ⚠️ גבולי (לעומת 0.841-0.885 שנכשלו בגרסאות קודמות)
+#
+# ⚠️ בגלל ה-PBO: ערכי אמצע בלבד. הציפייה היא לקצה התחתון של הטווח
+#    (~3.85-5$ לעסקה), לא לערך שנמדד בכיול הטוב ביותר.
+# ⚠️ 2024 חלש (+0.39$/עסקה) מול 2026 (+7.32$) — ייתכן שהאפקט תלוי-רג'ים.
+# ⚠️ מסנן נפח שיפר בבקטסט (58%→61%) אך אינו פעיל: הבקטסט השתמש ב-tick-volume
+#    של Dukascopy, והנפח של Twelve Data הוא מדד אחר. נאסף ללוג לאימות עתידי.
+M4_ENABLED       = True
+M4_LIVE          = False   # מעקב בלבד עד שמדגם חי יצדיק אחרת
+M4_RANGE_BARS    = 2       # כמה שעות אחורה מגדירות את הטווח
+M4_TRADE_START_UTC = 7
+M4_TRADE_END_UTC   = 20
+M4_HOLD_HOURS    = 4       # אופק מקסימלי
+M4_TARGET_MULT   = 1.0     # יעד = טווח × זה   (ערך אמצע, לא מכוונן)
+M4_STOP_MULT     = 1.0     # סטופ = טווח × זה
+M4_RENKO_BOX     = 20.0
+M4_RENKO_CONFIRM = 2
+M4_VOL_MULT      = 0.0     # 0 = מסנן נפח כבוי. ר' ההערה למעלה.
+M4_SIGNAL_OPEN   = sig_open(4)
+M4_SIGNAL_CLOSE  = sig_close(4)
+IL_TZ  = ZoneInfo("Asia/Jerusalem")
+UTC_TZ = ZoneInfo("UTC")
 RENKO_CONFIRM   = 2       # לבנים רצופות באותו כיוון = כניסה
 RENKO_TARGET    = 6       # יעד, בקופסאות
 RENKO_STOP      = 3       # סטופ, בקופסאות (יחס 2:1)
@@ -371,7 +410,11 @@ def default_data():
         # (slow_state/slow_shadow) ושיטה 3 (tf_state/tf_signals) נפרדות.
         "renko_state": {},
         "renko_signals": [],
-        "renko_seq": 0
+        "renko_seq": 0,
+        # 3.11.0: שיטה 4 — מפתחות נפרדים לגמרי משיטות 1/2/3
+        "m4_state": {},
+        "m4_signals": [],
+        "m4_seq": 0
     }
 
 def _merge_defaults(data):
@@ -1209,7 +1252,11 @@ def _fetch_history(symbol, interval, outputsize):
                 "o": float(v["open"]),
                 "h": float(v["high"]),
                 "l": float(v["low"]),
-                "c": float(v["close"])
+                "c": float(v["close"]),
+                # 3.11.0: נאסף לתיעוד בלבד. הבקטסט של שיטה 4 השתמש ב-tick-volume
+                # של Dukascopy; אין ערובה שהנפח של Twelve Data מתנהג זהה, ולכן
+                # מסנן הנפח אינו פעיל (M4_VOL_MULT=0). נאסף כדי לאמת בהמשך.
+                "v": float(v["volume"]) if v.get("volume") not in (None, "") else None
             })
         out.sort(key=lambda x: x["t"])
         return out
@@ -2384,6 +2431,167 @@ def tf_monitor(data, h1):
               f"{hit} {pnl:+.2f}", flush=True)
 
     return changed
+
+
+def _m4_utc(t_il):
+    """זמן-ישראל נאיבי (כפי ש-_fetch_history מחזיר) → UTC.
+    חובה zoneinfo: ישראל UTC+2 בחורף, UTC+3 בקיץ, והבקטסט הוגדר ב-UTC."""
+    try:
+        return t_il.replace(tzinfo=IL_TZ).astimezone(UTC_TZ)
+    except Exception:
+        return t_il
+
+
+def _m4_renko(state, closes):
+    """מעדכן מצב Renko (קופסה M4_RENKO_BOX) ומחזיר כיוון נוכחי: 1 / -1 / 0."""
+    ref = state.get("rk_ref")
+    dirs = state.get("rk_dirs") or []
+    if ref is None and closes:
+        ref = closes[0]
+    for c in closes:
+        while c - ref >= M4_RENKO_BOX:
+            ref += M4_RENKO_BOX; dirs.append(1)
+        while ref - c >= M4_RENKO_BOX:
+            ref -= M4_RENKO_BOX; dirs.append(-1)
+    dirs = dirs[-10:]
+    state["rk_ref"] = ref
+    state["rk_dirs"] = dirs
+    if len(dirs) < M4_RENKO_CONFIRM:
+        return 0
+    r = dirs[-M4_RENKO_CONFIRM:]
+    if all(x == 1 for x in r): return 1
+    if all(x == -1 for x in r): return -1
+    return 0
+
+
+def m4_signal_id(data):
+    seq = int(data.get("m4_seq", 0)) + 1
+    data["m4_seq"] = seq
+    return seq
+
+
+def m4_scan(data, h1):
+    """שיטה 4 — פריצת טווח מתגלגל מסוננת ב-Renko. מעקב בלבד (M4_LIVE=False).
+
+    משתמשת בנרות ה-H1 ש-tf_scan כבר משכה — אפס קריאות API נוספות.
+    הנרות בשעון ישראל; ההמרה ל-UTC דרך _m4_utc.
+    """
+    if not M4_ENABLED or not h1 or len(h1) < 60:
+        return
+
+    state = data.setdefault("m4_state", {})
+    log = data.setdefault("m4_signals", [])
+    now = now_il().replace(tzinfo=None)
+
+    closed = [b for b in h1 if b["t"] + datetime.timedelta(hours=1) <= now]
+    if len(closed) < 60:
+        return
+
+    last_seen = state.get("last_bar")
+    if last_seen is None:
+        _m4_renko(state, [b["c"] for b in closed])
+        state["last_bar"] = closed[-1]["t"].isoformat()
+        state["pos"] = None
+        print(f"[M4] אתחול — ייחוס Renko {state.get('rk_ref')}", flush=True)
+        return
+
+    fresh = [b for b in closed if b["t"].isoformat() > last_seen]
+    if not fresh:
+        return
+    state["last_bar"] = closed[-1]["t"].isoformat()
+    rk_dir = _m4_renko(state, [b["c"] for b in fresh])
+
+    bar = closed[-1]
+    u = _m4_utc(bar["t"])
+    pos = state.get("pos")
+    changed = False
+
+    # ── פוזיציה פתוחה: יציאה נבדקת לפני כניסה חדשה ──
+    if pos:
+        opened = datetime.datetime.fromisoformat(pos["opened_bar"])
+        held = (bar["t"] - opened).total_seconds() / 3600.0
+        reason = None; exit_px = None
+        if pos["dir"] == 1:
+            if bar["l"] <= pos["stop"]:   exit_px, reason = pos["stop"], "סטופ"
+            elif bar["h"] >= pos["target"]: exit_px, reason = pos["target"], "יעד"
+        else:
+            if bar["h"] >= pos["stop"]:   exit_px, reason = pos["stop"], "סטופ"
+            elif bar["l"] <= pos["target"]: exit_px, reason = pos["target"], "יעד"
+        if reason is None and (held >= M4_HOLD_HOURS or u.hour >= M4_TRADE_END_UTC):
+            exit_px, reason = bar["c"], "תפוגה"
+        if reason:
+            pts = (exit_px - pos["entry"]) * pos["dir"]
+            ils = points_to_ils(abs(pts)) * (1 if pts >= 0 else -1)
+            icon = "✅" if pts > 0 else ("➖" if reason == "תפוגה" else "🛑")
+            for rec in reversed(log):
+                if rec.get("status") == "open":
+                    rec.update(status="closed", exit=round(exit_px, 2), reason=reason,
+                               pnl=round(pts, 2), close_time=now.isoformat())
+                    break
+            done = [r for r in log if r.get("status") == "closed"]
+            wins = sum(1 for r in done if (r.get("pnl") or 0) > 0)
+            tot = sum(r.get("pnl") or 0 for r in done)
+            send_telegram(
+                f"{METHOD_MARK[4]} <b>עסקה שיטה 4 #{pos['id']} — {reason}</b>\n"
+                f"{'קנייה' if pos['dir']==1 else 'מכירה'} · טווח {pos['range']:.1f}$\n"
+                f"כניסה {pos['entry']:.2f} → יציאה {exit_px:.2f}  ({pts:+.2f}$)  {icon}\n"
+                f"<b>{ils:+.2f} ש\"ח</b> ({POSITION_SIZE_OZ}oz)\n\n"
+                f"מצטבר שיטה 4: {len(done)} סגורות · "
+                f"{(100*wins/len(done) if done else 0):.0f}% · {tot:+.2f}$\n"
+                f"{M4_SIGNAL_CLOSE}"
+            )
+            state["pos"] = None; pos = None; changed = True
+
+    # ── כניסה: פריצת טווח 2 השעות הקודמות + אישור Renko ──
+    if (not pos and M4_TRADE_START_UTC <= u.hour < M4_TRADE_END_UTC
+            and len(closed) > M4_RANGE_BARS + 1):
+        w = closed[-(M4_RANGE_BARS + 1):-1]      # הנרות שלפני הנוכחי
+        hi = max(b["h"] for b in w); lo = min(b["l"] for b in w); R = hi - lo
+        if R > 0:
+            d = None
+            if bar["h"] > hi: d = 1
+            elif bar["l"] < lo: d = -1
+            if d and rk_dir == d:
+                # מסנן נפח — כבוי כברירת מחדל (M4_VOL_MULT=0), ר' הערת הקבועים
+                vol_ok = True
+                if M4_VOL_MULT > 0:
+                    vols = [b.get("v") for b in closed[-25:] if b.get("v")]
+                    cur = bar.get("v")
+                    if cur and len(vols) >= 10:
+                        med = sorted(vols)[len(vols) // 2]
+                        vol_ok = cur >= M4_VOL_MULT * med
+                if vol_ok:
+                    entry = hi if d == 1 else lo
+                    stop = entry - d * M4_STOP_MULT * R
+                    target = entry + d * M4_TARGET_MULT * R
+                    sid = m4_signal_id(data)
+                    state["pos"] = {"id": sid, "dir": d, "entry": entry, "stop": stop,
+                                    "target": target, "range": R,
+                                    "opened_bar": bar["t"].isoformat()}
+                    log.append({"id": sid, "time": now.isoformat(), "status": "open",
+                                "direction": "קנייה" if d == 1 else "מכירה",
+                                "entry": round(entry, 2), "stop": round(stop, 2),
+                                "target": round(target, 2), "range": round(R, 2),
+                                "vol": bar.get("v")})
+                    send_telegram(
+                        f"{M4_SIGNAL_OPEN}\n"
+                        f"<b>{'קנייה' if d==1 else 'מכירה'}</b> · פריצת טווח {M4_RANGE_BARS}ש · #{sid}\n"
+                        f"טווח {lo:.2f}–{hi:.2f}  ({R:.1f}$)\n\n"
+                        f"כניסה  <b>{entry:.2f}</b>   (מחיר עכשיו {bar['c']:.2f})\n"
+                        f"סטופ   {stop:.2f}   ({-R:+.1f}$)\n"
+                        f"יעד    {target:.2f}   ({R:+.1f}$)\n"
+                        f"סיכון {points_to_ils(R):.0f} ש\"ח · {POSITION_SIZE_OZ}oz\n"
+                        f"אישור Renko {M4_RENKO_BOX:.0f}$ ✔ · אופק {M4_HOLD_HOURS}ש\n\n"
+                        f"<i>מעקב בלבד — לא למסחר אמיתי. PBO=0.214 (גבולי): הכיול "
+                        f"אינו אמין, הציפייה היא לקצה התחתון. נאסף מדגם חי.</i>\n"
+                        f"{M4_SIGNAL_CLOSE}"
+                    )
+                    changed = True
+
+    if len(log) > 400:
+        data["m4_signals"] = log[-400:]
+    if changed:
+        save_data(data)
 
 
 def renko_signal_id(data):
@@ -4561,6 +4769,12 @@ def main():
                                 renko_scan(data, _h1)
                         except Exception as _e:
                             print(f"[RENKO] שגיאה: {_e}", flush=True)
+                        # 3.11.0: שיטה 4 — אותם נרות H1, אפס קריאות API נוספות.
+                        try:
+                            if _h1:
+                                m4_scan(data, _h1)
+                        except Exception as _e:
+                            print(f"[M4] שגיאה: {_e}", flush=True)
                     except Exception as e:
                         print(f"[SLOW] שגיאה: {e}", flush=True)
 
