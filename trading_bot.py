@@ -183,6 +183,18 @@ TF_SIGNAL_CLOSE = sig_close(3)
 # ואין CPCV/walk-forward (tools/cpcv.py לא קיים). לכן — מעקב בלבד.
 RENKO_LIVE      = False   # מעקב בלבד. True רק אחרי שהמעקב יצדיק זאת.
 RENKO_BOX       = 3.0     # גודל קופסה בדולרים
+OLD_M1_ENABLED  = False
+M4_ENABLED      = False   # שיטה 4 הישנה (פריצת טווח) — הצצה לעתיד, מושבתת
+# 3.12.0: שיטה 4 החדשה — Renko עם קופסה לפי ATR, כניסה בפקודת Stop ברמת הלבנה.
+# מעקב בלבד. שתי גרסאות במקביל: (שם, מכפיל ATR, לבנים לאישור).
+# בקטסט 3 שנים (M15, מילוי ברמה): A 3.8/יום +1.8₪ · C 2.8/יום +3.2₪ לעסקה.
+# עם החלקה 0.5$ שתיהן סביב אפס — המילוי ברמה (פקודת Stop מראש) הוא התנאי.
+# B (לבנה אחת, שני הצדדים) הוסרה 23/09: התוצאה תלויה בסדר הנגיעה בתוך השעה (+13.8 מול -1.6₪).
+M4V_ENABLED     = True
+M4V_VARIANTS    = [("A", 0.4, 2), ("C", 0.5, 2)]
+M4V_STOP_BOX    = 3       # סטופ בקופסאות
+M4V_TGT_BOX     = 6       # יעד בקופסאות
+M4V_MAX_BRICKS  = 6       # תפוגה
 
 # ══ 3.11.0: שיטה 4 — פריצת טווח מתגלגל מסוננת ב-Renko ══════════════════
 # מקור: חיפוש מבנה-זמן אחרי ששיטה 1 נסגרה במדידה (כל גרסה תוך-יומית נמדדה
@@ -290,7 +302,7 @@ def backup_window_txt(now):
 # סקאלת סיכון 40 ש"ח). רשומה ישנה וחדשה נראות זהות ואי אפשר להבדיל
 # ביניהן בדיעבד. הכלל "אל תערבב נתונים משתי סקאלות" תוחזק עד היום
 # לפי תאריך בלבד — עכשיו הוא נאכף בנתונים עצמם.
-BOT_VERSION = "3.9.8"
+BOT_VERSION = "3.12.0"
 PNL_SCALE = "0.75oz-net"        # מה שהשדה pnl מודד בגרסה הזו
 
 DATA_FILE = "/tmp/bot_data.json"
@@ -1232,6 +1244,17 @@ def analyze_and_signal(symbol_name, symbol_code, data):
 # מריץ את הלוגיקה החיה על נתוני 30 הימים האחרונים ומדווח מה היה קורה.
 # לא נוגע בנתונים האמיתיים — קריאה וחישוב בלבד.
 # ============================================================
+def _clean_bars(bars):
+    out = []
+    for b in bars:
+        if b["h"] == b["l"]:
+            continue
+        wd = b["t"].weekday()
+        if wd == 6 or (wd == 5 and b["t"].hour >= 1):
+            continue
+        out.append(b)
+    return out
+
 def _fetch_history(symbol, interval, outputsize):
     """מושך נרות היסטוריים בשעון ישראל, ממוינים מהישן לחדש."""
     try:
@@ -1263,6 +1286,7 @@ def _fetch_history(symbol, interval, outputsize):
                 # מסנן הנפח אינו פעיל (M4_VOL_MULT=0). נאסף כדי לאמת בהמשך.
                 "v": float(v["volume"]) if v.get("volume") not in (None, "") else None
             })
+        out = _clean_bars(out)
         out.sort(key=lambda x: x["t"])
         return out
     except Exception as e:
@@ -2599,6 +2623,152 @@ def m4_scan(data, h1):
 
     if len(log) > 400:
         data["m4_signals"] = log[-400:]
+    if changed:
+        save_data(data)
+
+
+def _m4v_atr(bars, period=14):
+    if len(bars) < period + 1:
+        return None
+    trs = []
+    for i in range(1, len(bars)):
+        h, l, pc = bars[i]["h"], bars[i]["l"], bars[i - 1]["c"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    return sum(trs[-period:]) / period
+
+
+def m4v_scan(data, h1):
+    """שיטה 4 (3.12.0) — Renko עם קופסה = מכפיל × ATR14 של H1. מעקב בלבד.
+
+    על כל נר H1 שנסגר, לפי הסדר:
+      1. פקודה ממתינה מהסגירה הקודמת — מתמלאת אם ה-High/Low של הנר נגע ברמה (מילוי ברמה).
+      2. פוזיציה פתוחה — סטופ/יעד לפי High/Low של הנר (סטופ קודם אם שניהם באותו נר).
+         בנר המילוי עצמו: רק סטופ, ורק אם הנר נסגר מעבר לו.
+      3. עדכון לבנים לפי סגירת הנר; תפוגה אחרי M4V_MAX_BRICKS לבנים.
+      4. פקודה ממתינה חדשה לנר הבא: 2 לבנים = רק בכיוון הלבנה האחרונה; 1 = שני הצדדים.
+    אפס קריאות API נוספות — אותם נרות H1 ש-tf_scan משך.
+    """
+    if not M4V_ENABLED or not h1:
+        return
+    now = now_il().replace(tzinfo=None)
+    closed = [b for b in h1 if b["t"] + datetime.timedelta(hours=1) <= now and b["h"] > b["l"]]
+    if len(closed) < 60:
+        return
+    st_all = data.setdefault("m4v_state", {})
+    log = data.setdefault("m4v_signals", [])
+    changed = False
+
+    for name, mult, conf in M4V_VARIANTS:
+        st = st_all.setdefault(name, {})
+        if st.get("last_bar") is None:
+            # אתחול: בונים ייחוס מההיסטוריה בלי לשדר
+            atr0 = _m4v_atr(closed[:-1]) or 10.0
+            box0 = max(1.0, mult * atr0)
+            ref = closed[0]["c"]; dirs = []
+            for b in closed:
+                while b["c"] - ref >= box0: ref += box0; dirs.append(1)
+                while ref - b["c"] >= box0: ref -= box0; dirs.append(-1)
+            st.update(ref=ref, dirs=dirs[-10:], pos=None, pend=None,
+                      last_bar=closed[-1]["t"].isoformat())
+            changed = True
+            continue
+
+        fresh = [b for b in closed if b["t"].isoformat() > st["last_bar"]]
+        for b in fresh:
+            upto = [x for x in closed if x["t"] < b["t"]]
+            atr = _m4v_atr(upto[-60:])
+            if not atr:
+                continue
+            box = max(1.0, mult * atr)
+            pos, pend = st.get("pos"), st.get("pend")
+
+            # 1) מילוי פקודה ממתינה
+            if pos is None and pend:
+                touched = [(d, lvl) for d, lvl in pend
+                           if (d == 1 and b["h"] >= lvl) or (d == -1 and b["l"] <= lvl)]
+                hit = None
+                if len(touched) == 1:
+                    hit = touched[0]
+                elif touched:   # שני הצדדים באותו נר — לא יודעים מה קודם; לוקחים את הצד שנגד סגירת הנר (פסימי)
+                    want = -1 if b["c"] >= b["o"] else 1
+                    hit = next(x for x in touched if x[0] == want)
+                if hit:
+                    d, lvl = hit
+                    e = max(lvl, b["o"]) if d == 1 else min(lvl, b["o"])
+                    pbox = st.get("pend_box", box)
+                    sid = int(data.get("m4v_seq", 0)) + 1; data["m4v_seq"] = sid
+                    pos = dict(id=sid, v=name, d=d, e=round(e, 2),
+                               stop=round(e - d * M4V_STOP_BOX * pbox, 2),
+                               tgt=round(e + d * M4V_TGT_BOX * pbox, 2), br=0, t=b["t"].isoformat())
+                    log.append(dict(id=sid, variant=name, time=b["t"].isoformat(), status="open",
+                                    direction="קנייה" if d == 1 else "מכירה",
+                                    entry=pos["e"], stop=pos["stop"], target=pos["tgt"], box=round(pbox, 2)))
+                    send_telegram(
+                        f"{M4_SIGNAL_OPEN}\n"
+                        f"<b>שיטה 4{name} · {'קנייה' if d == 1 else 'מכירה'}</b> · #{sid}\n"
+                        f"Renko {pbox:.1f}$ ({mult}×ATR · {conf} לבנים)\n\n"
+                        f"כניסה (Stop)  <b>{pos['e']:.2f}</b>\n"
+                        f"סטופ   {pos['stop']:.2f}\n"
+                        f"יעד    {pos['tgt']:.2f}\n\n"
+                        f"<i>מעקב בלבד. תוצאה נמדדת ברמת הפקודה, סטופ/יעד לפי המחיר בתוך השעה.</i>\n"
+                        f"{M4_SIGNAL_CLOSE}")
+                    changed = True
+                    # בנר המילוי: אם הנר נגע בסטופ — סופרים סטופ (פסימי; אין לנו את הסדר בתוך השעה).
+                    # יעד בנר המילוי לא נספר.
+                    if (d == 1 and b["l"] <= pos["stop"]) or (d == -1 and b["h"] >= pos["stop"]):
+                        pos["exit"], pos["reason"] = pos["stop"], "סטופ"
+                    else:
+                        pos["fresh"] = True
+                st["pend"] = None
+
+            # 2) סטופ / יעד
+            if pos is not None and "reason" not in pos and not pos.pop("fresh", False):
+                d = pos["d"]
+                if (d == 1 and b["l"] <= pos["stop"]) or (d == -1 and b["h"] >= pos["stop"]):
+                    pos["exit"], pos["reason"] = pos["stop"], "סטופ"
+                elif (d == 1 and b["h"] >= pos["tgt"]) or (d == -1 and b["l"] <= pos["tgt"]):
+                    pos["exit"], pos["reason"] = pos["tgt"], "יעד"
+
+            # 3) לבנים + תפוגה
+            ref = st["ref"]; dirs = st.get("dirs") or []; nb = 0
+            while b["c"] - ref >= box: ref += box; dirs.append(1); nb += 1
+            while ref - b["c"] >= box: ref -= box; dirs.append(-1); nb += 1
+            st["ref"], st["dirs"] = ref, dirs[-10:]
+            if pos is not None and "reason" not in pos and nb:
+                pos["br"] += nb
+                if pos["br"] >= M4V_MAX_BRICKS:
+                    pos["exit"], pos["reason"] = round(b["c"], 2), "תפוגה"
+
+            # סגירת עסקה
+            if pos is not None and "reason" in pos:
+                pts = pos["d"] * (pos["exit"] - pos["e"]) - SPREAD_POINTS
+                for rec in reversed(log):
+                    if rec.get("id") == pos["id"]:
+                        rec.update(status="closed", exit=pos["exit"], reason=pos["reason"],
+                                   pnl=round(pts, 2), close_time=b["t"].isoformat())
+                        break
+                cl = [r for r in log if r.get("variant") == name and r.get("status") == "closed"]
+                w = sum(1 for r in cl if r["pnl"] > 0)
+                send_telegram(
+                    f"{METHOD_MARK[4]} <b>שיטה 4{name} #{pos['id']} — {pos['reason']}</b>\n"
+                    f"{pos['e']:.2f} → {pos['exit']:.2f}  ({pts:+.2f}$ אחרי ספרד)\n"
+                    f"מצטבר 4{name}: {len(cl)} · {100 * w / len(cl):.0f}% · "
+                    f"{sum(r['pnl'] for r in cl):+.2f}$\n{M4_SIGNAL_CLOSE}")
+                pos = None
+                changed = True
+            st["pos"] = pos
+
+            # 4) פקודה ממתינה לנר הבא
+            if pos is None and st["dirs"]:
+                ld = st["dirs"][-1]
+                st["pend"] = [(1, round(ref + box, 2)), (-1, round(ref - box, 2))] if conf == 1 \
+                             else [(ld, round(ref + ld * box, 2))]
+                st["pend_box"] = box
+            st["last_bar"] = b["t"].isoformat()
+            changed = True
+
+    if len(log) > 600:
+        data["m4v_signals"] = log[-600:]
     if changed:
         save_data(data)
 
@@ -4755,7 +4925,7 @@ def main():
 
                 for name, code in SYMBOLS.items():
                     try:
-                        analyze_and_signal(name, code, data)
+                        if OLD_M1_ENABLED: analyze_and_signal(name, code, data)
                         time.sleep(3)
                     except Exception as e:
                         print(f"שגיאה ב{name}: {e}", flush=True)
@@ -4781,7 +4951,8 @@ def main():
                         # 3.11.0: שיטה 4 — אותם נרות H1, אפס קריאות API נוספות.
                         try:
                             if _h1:
-                                m4_scan(data, _h1)
+                                if M4_ENABLED: m4_scan(data, _h1)
+                                m4v_scan(data, _h1)
                         except Exception as _e:
                             print(f"[M4] שגיאה: {_e}", flush=True)
                     except Exception as e:
