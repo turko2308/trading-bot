@@ -242,6 +242,7 @@ RENKO_CONFIRM   = 2       # לבנים רצופות באותו כיוון = כנ
 RENKO_TARGET    = 6       # יעד, בקופסאות
 RENKO_STOP      = 3       # סטופ, בקופסאות (יחס 2:1)
 RENKO_MAX_HOLD  = 6       # מקסימום לבנים בפוזיציה לפני יציאה בשוק
+RENKO_MAX_LATE  = 5.0     # 3.15.0: לא שולחים אם המחיר כבר ברח יותר מזה מרמת הלבנה
 RENKO_SIGNAL_OPEN  = sig_open(1)
 RENKO_SIGNAL_CLOSE = sig_close(1)
 
@@ -302,7 +303,7 @@ def backup_window_txt(now):
 # סקאלת סיכון 40 ש"ח). רשומה ישנה וחדשה נראות זהות ואי אפשר להבדיל
 # ביניהן בדיעבד. הכלל "אל תערבב נתונים משתי סקאלות" תוחזק עד היום
 # לפי תאריך בלבד — עכשיו הוא נאכף בנתונים עצמם.
-BOT_VERSION = "3.14.0"
+BOT_VERSION = "3.15.0"
 PNL_SCALE = "0.75oz-net"        # מה שהשדה pnl מודד בגרסה הזו
 
 DATA_FILE = "/tmp/bot_data.json"
@@ -2920,9 +2921,12 @@ def renko_scan(data, h1):
         state["last_bar"] = closed[-1]["t"].isoformat()
         bricks = _renko_new_bricks(state, [b["c"] for b in fresh])
         dirs = state.get("dirs") or []
+        decided = False   # 3.15.0: אחרי כניסה/דילוג בנר הזה — הלבנים הבאות בו כבר מאחורינו
         for bdir, bpx in bricks:
             dirs.append(bdir)
             dirs = dirs[-10:]
+            if decided:
+                continue
             if pos:
                 pos["held"] = pos.get("held", 0) + 1
                 if pos["held"] >= RENKO_MAX_HOLD:
@@ -2935,10 +2939,18 @@ def renko_scan(data, h1):
                 if all(x == recent[0] for x in recent):
                     d = recent[0]
                     lvl = bpx
-                    stop = lvl - RENKO_STOP * RENKO_BOX if d == 1 else lvl + RENKO_STOP * RENKO_BOX
-                    target = lvl + RENKO_TARGET * RENKO_BOX if d == 1 else lvl - RENKO_TARGET * RENKO_BOX
                     entry = live
                     late = (entry - lvl) * d
+                    decided = True
+                    if late > RENKO_MAX_LATE:
+                        # לא רודפים — המחיר כבר ברח. נספר, לא נשלח.
+                        data["renko_skipped"] = int(data.get("renko_skipped", 0)) + 1
+                        print(f"[RENKO] דילוג: איחור {late:+.2f}$ > {RENKO_MAX_LATE}$", flush=True)
+                        changed = True
+                        continue
+                    # 3.15.0: סטופ/יעד מהמחיר האמיתי (ב-3.13.0 נשארו לפי הלבנה ⇒ #67: סטופ 23$, יעד 4$)
+                    stop = entry - d * RENKO_STOP * RENKO_BOX
+                    target = entry + d * RENKO_TARGET * RENKO_BOX
                     sid = renko_signal_id(data)
                     pos = {"id": sid, "dir": d, "entry": entry, "brick_level": lvl, "stop": stop,
                            "target": target, "held": 0, "opened": now.isoformat(), "acct": "real",
