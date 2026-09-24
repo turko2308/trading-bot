@@ -302,7 +302,7 @@ def backup_window_txt(now):
 # סקאלת סיכון 40 ש"ח). רשומה ישנה וחדשה נראות זהות ואי אפשר להבדיל
 # ביניהן בדיעבד. הכלל "אל תערבב נתונים משתי סקאלות" תוחזק עד היום
 # לפי תאריך בלבד — עכשיו הוא נאכף בנתונים עצמם.
-BOT_VERSION = "3.13.0"
+BOT_VERSION = "3.14.0"
 PNL_SCALE = "0.75oz-net"        # מה שהשדה pnl מודד בגרסה הזו
 
 DATA_FILE = "/tmp/bot_data.json"
@@ -2637,31 +2637,50 @@ def _m4v_atr(bars, period=14):
     return sum(trs[-period:]) / period
 
 
-def m4v_scan(data, h1):
-    """שיטה 4 (3.12.0) — Renko עם קופסה = מכפיל × ATR14 של H1. מעקב בלבד.
+def _m4v_close(data, log, name, pos, px, reason, now):
+    pts = pos["d"] * (px - pos["e"]) - SPREAD_POINTS
+    for rec in reversed(log):
+        if rec.get("id") == pos["id"]:
+            rec.update(status="closed", exit=round(px, 2), reason=reason,
+                       pnl=round(pts, 2), close_time=now.isoformat())
+            break
+    cl = [r for r in log if r.get("variant") == name and r.get("status") == "closed"]
+    w = sum(1 for r in cl if r["pnl"] > 0)
+    send_telegram(
+        f"{METHOD_MARK[4]} <b>שיטה 4{name} #{pos['id']} — {reason}</b>\n"
+        f"{pos['e']:.2f} → {px:.2f}  ({pts:+.2f}$ אחרי ספרד)\n"
+        f"מצטבר 4{name}: {len(cl)} · {100 * w / len(cl):.0f}% · "
+        f"{sum(r['pnl'] for r in cl):+.2f}$\n{M4_SIGNAL_CLOSE}")
 
-    על כל נר H1 שנסגר, לפי הסדר:
-      1. פקודה ממתינה מהסגירה הקודמת — מתמלאת אם ה-High/Low של הנר נגע ברמה (מילוי ברמה).
-      2. פוזיציה פתוחה — סטופ/יעד לפי High/Low של הנר (סטופ קודם אם שניהם באותו נר).
-         בנר המילוי עצמו: רק סטופ, ורק אם הנר נסגר מעבר לו.
-      3. עדכון לבנים לפי סגירת הנר; תפוגה אחרי M4V_MAX_BRICKS לבנים.
-      4. פקודה ממתינה חדשה לנר הבא: 2 לבנים = רק בכיוון הלבנה האחרונה; 1 = שני הצדדים.
-    אפס קריאות API נוספות — אותם נרות H1 ש-tf_scan משך.
+
+def m4v_scan(data, h1):
+    """שיטה 4 (3.14.0) — Renko עם קופסה = מכפיל × ATR14 של H1. מעקב בלבד.
+
+    בכל סריקה (כל 10 דק'):
+      א. מילוי / סטופ / יעד — לפי High/Low של הנרות, כולל הנר החי. בנר של המילוי נספרים
+         רק High/Low שנקבעו אחרי המילוי (hi0/lo0 = הקיצון ברגע שזוהה המילוי). כך סטופ
+         שקרה לפני הכניסה לא נספר (באג 3.13.0: 4A #3, 24/09).
+      ב. על כל נר H1 שנסגר: לבנים, תפוגה (6 לבנים), ופקודה ממתינה חדשה לנר הבא.
+      ג. הודעה מראש "הצב/עדכן פקודה" רק כשהרמה משתנה.
+    אפס קריאות API נוספות.
     """
     if not M4V_ENABLED or not h1:
         return
     now = now_il().replace(tzinfo=None)
-    closed = [b for b in h1 if b["t"] + datetime.timedelta(hours=1) <= now and b["h"] > b["l"]]
+    hour = datetime.timedelta(hours=1)
+    bars = [b for b in h1 if b["h"] > b["l"] or b["t"] + hour > now]
+    closed = [b for b in bars if b["t"] + hour <= now]
+    forming = bars[-1] if bars and bars[-1]["t"] + hour > now else None
     if len(closed) < 60:
         return
     st_all = data.setdefault("m4v_state", {})
     log = data.setdefault("m4v_signals", [])
     changed = False
+    INF = float("inf")
 
     for name, mult, conf in M4V_VARIANTS:
         st = st_all.setdefault(name, {})
         if st.get("last_bar") is None:
-            # אתחול: בונים ייחוס מההיסטוריה בלי לשדר
             atr0 = _m4v_atr(closed[:-1]) or 10.0
             box0 = max(1.0, mult * atr0)
             ref = closed[0]["c"]; dirs = []
@@ -2673,98 +2692,84 @@ def m4v_scan(data, h1):
             changed = True
             continue
 
+        # מעבר מ-3.13.0: פוזיציה בלי hi0/lo0 — נר המילוי כבר נבדק במלואו
+        p = st.get("pos")
+        if p and "bar_t" not in p:
+            p.update(bar_t=p["t"], hi0=INF, lo0=-INF)
+
+        def fill_exit(b):
+            nonlocal changed
+            pos, pend = st.get("pos"), st.get("pend")
+            if pos:
+                hi, lo = b["h"], b["l"]
+                if b["t"].isoformat() == pos["bar_t"]:
+                    hi = hi if hi > pos["hi0"] else pos["e"]
+                    lo = lo if lo < pos["lo0"] else pos["e"]
+                d = pos["d"]
+                if (d == 1 and lo <= pos["stop"]) or (d == -1 and hi >= pos["stop"]):
+                    _m4v_close(data, log, name, pos, pos["stop"], "סטופ", now); st["pos"] = None; changed = True
+                elif (d == 1 and hi >= pos["tgt"]) or (d == -1 and lo <= pos["tgt"]):
+                    _m4v_close(data, log, name, pos, pos["tgt"], "יעד", now); st["pos"] = None; changed = True
+                return
+            if not pend or b["t"].isoformat() < st.get("pend_t", ""):
+                return
+            touched = [(d, lvl) for d, lvl in pend
+                       if (d == 1 and b["h"] >= lvl) or (d == -1 and b["l"] <= lvl)]
+            if not touched:
+                return
+            if len(touched) == 1:
+                d, lvl = touched[0]
+            else:   # שני הצדדים באותו נר — הצד שנגד כיוון הנר (פסימי)
+                want = -1 if b["c"] >= b["o"] else 1
+                d, lvl = next(x for x in touched if x[0] == want)
+            e = max(lvl, b["o"]) if d == 1 else min(lvl, b["o"])
+            pbox = st.get("pend_box", 1.0)
+            sid = int(data.get("m4v_seq", 0)) + 1; data["m4v_seq"] = sid
+            pos = dict(id=sid, v=name, d=d, e=round(e, 2),
+                       stop=round(e - d * M4V_STOP_BOX * pbox, 2),
+                       tgt=round(e + d * M4V_TGT_BOX * pbox, 2), br=0,
+                       t=b["t"].isoformat(), bar_t=b["t"].isoformat(), hi0=b["h"], lo0=b["l"])
+            log.append(dict(id=sid, variant=name, time=now.isoformat(), status="open",
+                            direction="קנייה" if d == 1 else "מכירה",
+                            entry=pos["e"], stop=pos["stop"], target=pos["tgt"], box=round(pbox, 2)))
+            send_telegram(
+                f"{METHOD_MARK[4]} <b>שיטה 4{name} #{sid} — הפקודה מולאה</b>\n"
+                f"{'קנייה' if d == 1 else 'מכירה'} ב-{pos['e']:.2f} · "
+                f"סטופ {pos['stop']:.2f} · יעד {pos['tgt']:.2f}\n"
+                f"<i>מעקב בלבד.</i>\n{M4_SIGNAL_CLOSE}")
+            st.update(pos=pos, pend=None, announced=None)
+            changed = True
+
         fresh = [b for b in closed if b["t"].isoformat() > st["last_bar"]]
         for b in fresh:
+            fill_exit(b)
             upto = [x for x in closed if x["t"] < b["t"]]
             atr = _m4v_atr(upto[-60:])
-            if not atr:
-                continue
-            box = max(1.0, mult * atr)
-            pos, pend = st.get("pos"), st.get("pend")
-
-            # 1) מילוי פקודה ממתינה
-            if pos is None and pend:
-                touched = [(d, lvl) for d, lvl in pend
-                           if (d == 1 and b["h"] >= lvl) or (d == -1 and b["l"] <= lvl)]
-                hit = None
-                if len(touched) == 1:
-                    hit = touched[0]
-                elif touched:   # שני הצדדים באותו נר — לא יודעים מה קודם; לוקחים את הצד שנגד סגירת הנר (פסימי)
-                    want = -1 if b["c"] >= b["o"] else 1
-                    hit = next(x for x in touched if x[0] == want)
-                if hit:
-                    d, lvl = hit
-                    e = max(lvl, b["o"]) if d == 1 else min(lvl, b["o"])
-                    pbox = st.get("pend_box", box)
-                    sid = int(data.get("m4v_seq", 0)) + 1; data["m4v_seq"] = sid
-                    pos = dict(id=sid, v=name, d=d, e=round(e, 2),
-                               stop=round(e - d * M4V_STOP_BOX * pbox, 2),
-                               tgt=round(e + d * M4V_TGT_BOX * pbox, 2), br=0, t=b["t"].isoformat())
-                    log.append(dict(id=sid, variant=name, time=b["t"].isoformat(), status="open",
-                                    direction="קנייה" if d == 1 else "מכירה",
-                                    entry=pos["e"], stop=pos["stop"], target=pos["tgt"], box=round(pbox, 2)))
-                    send_telegram(
-                        f"{METHOD_MARK[4]} <b>שיטה 4{name} #{sid} — הפקודה מולאה</b>\n"
-                        f"{'קנייה' if d == 1 else 'מכירה'} ב-{pos['e']:.2f} · "
-                        f"סטופ {pos['stop']:.2f} · יעד {pos['tgt']:.2f}\n"
-                        f"<i>מעקב בלבד.</i>\n{M4_SIGNAL_CLOSE}")
-                    st["announced"] = None
-                    changed = True
-                    # בנר המילוי: אם הנר נגע בסטופ — סופרים סטופ (פסימי; אין לנו את הסדר בתוך השעה).
-                    # יעד בנר המילוי לא נספר.
-                    if (d == 1 and b["l"] <= pos["stop"]) or (d == -1 and b["h"] >= pos["stop"]):
-                        pos["exit"], pos["reason"] = pos["stop"], "סטופ"
-                    else:
-                        pos["fresh"] = True
-                st["pend"] = None
-
-            # 2) סטופ / יעד
-            if pos is not None and "reason" not in pos and not pos.pop("fresh", False):
-                d = pos["d"]
-                if (d == 1 and b["l"] <= pos["stop"]) or (d == -1 and b["h"] >= pos["stop"]):
-                    pos["exit"], pos["reason"] = pos["stop"], "סטופ"
-                elif (d == 1 and b["h"] >= pos["tgt"]) or (d == -1 and b["l"] <= pos["tgt"]):
-                    pos["exit"], pos["reason"] = pos["tgt"], "יעד"
-
-            # 3) לבנים + תפוגה
-            ref = st["ref"]; dirs = st.get("dirs") or []; nb = 0
-            while b["c"] - ref >= box: ref += box; dirs.append(1); nb += 1
-            while ref - b["c"] >= box: ref -= box; dirs.append(-1); nb += 1
-            st["ref"], st["dirs"] = ref, dirs[-10:]
-            if pos is not None and "reason" not in pos and nb:
-                pos["br"] += nb
-                if pos["br"] >= M4V_MAX_BRICKS:
-                    pos["exit"], pos["reason"] = round(b["c"], 2), "תפוגה"
-
-            # סגירת עסקה
-            if pos is not None and "reason" in pos:
-                pts = pos["d"] * (pos["exit"] - pos["e"]) - SPREAD_POINTS
-                for rec in reversed(log):
-                    if rec.get("id") == pos["id"]:
-                        rec.update(status="closed", exit=pos["exit"], reason=pos["reason"],
-                                   pnl=round(pts, 2), close_time=b["t"].isoformat())
-                        break
-                cl = [r for r in log if r.get("variant") == name and r.get("status") == "closed"]
-                w = sum(1 for r in cl if r["pnl"] > 0)
-                send_telegram(
-                    f"{METHOD_MARK[4]} <b>שיטה 4{name} #{pos['id']} — {pos['reason']}</b>\n"
-                    f"{pos['e']:.2f} → {pos['exit']:.2f}  ({pts:+.2f}$ אחרי ספרד)\n"
-                    f"מצטבר 4{name}: {len(cl)} · {100 * w / len(cl):.0f}% · "
-                    f"{sum(r['pnl'] for r in cl):+.2f}$\n{M4_SIGNAL_CLOSE}")
-                pos = None
-                changed = True
-            st["pos"] = pos
-
-            # 4) פקודה ממתינה לנר הבא
-            if pos is None and st["dirs"]:
-                ld = st["dirs"][-1]
-                st["pend"] = [(1, round(ref + box, 2)), (-1, round(ref - box, 2))] if conf == 1 \
-                             else [(ld, round(ref + ld * box, 2))]
-                st["pend_box"] = box
+            if atr:
+                box = max(1.0, mult * atr)
+                ref = st["ref"]; dirs = st.get("dirs") or []; nb = 0
+                while b["c"] - ref >= box: ref += box; dirs.append(1); nb += 1
+                while ref - b["c"] >= box: ref -= box; dirs.append(-1); nb += 1
+                st["ref"], st["dirs"] = ref, dirs[-10:]
+                pos = st.get("pos")
+                if pos and nb:
+                    pos["br"] += nb
+                    if pos["br"] >= M4V_MAX_BRICKS:
+                        _m4v_close(data, log, name, pos, round(b["c"], 2), "תפוגה", now)
+                        st["pos"] = None
+                if st.get("pos") is None and st["dirs"]:
+                    ld = st["dirs"][-1]
+                    st["pend"] = ([[1, round(ref + box, 2)], [-1, round(ref - box, 2)]] if conf == 1
+                                  else [[ld, round(ref + ld * box, 2)]])
+                    st["pend_box"] = box
+                    st["pend_t"] = (b["t"] + hour).isoformat()
             st["last_bar"] = b["t"].isoformat()
             changed = True
 
-        # 5) 3.13.0: הודעה מראש — רמת הפקודה לשעה הבאה, רק אם השתנתה
+        if forming is not None:
+            fill_exit(forming)
+
+        # הודעה מראש — רק אם הרמה השתנתה
         pend = st.get("pend")
         if fresh and pend and st.get("pos") is None:
             key = [list(x) for x in pend]
@@ -2772,10 +2777,9 @@ def m4v_scan(data, h1):
                 pb = st.get("pend_box", 0)
                 lines = []
                 for d, lvl in pend:
-                    stp = lvl - d * M4V_STOP_BOX * pb
-                    tgt = lvl + d * M4V_TGT_BOX * pb
                     lines.append(f"{'Buy Stop' if d == 1 else 'Sell Stop'}  <b>{lvl:.2f}</b>\n"
-                                 f"סטופ {stp:.2f} · יעד {tgt:.2f}")
+                                 f"סטופ {lvl - d * M4V_STOP_BOX * pb:.2f} · "
+                                 f"יעד {lvl + d * M4V_TGT_BOX * pb:.2f}")
                 prev = st.get("announced")
                 send_telegram(
                     f"{M4_SIGNAL_OPEN}\n"
