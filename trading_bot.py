@@ -302,7 +302,7 @@ def backup_window_txt(now):
 # סקאלת סיכון 40 ש"ח). רשומה ישנה וחדשה נראות זהות ואי אפשר להבדיל
 # ביניהן בדיעבד. הכלל "אל תערבב נתונים משתי סקאלות" תוחזק עד היום
 # לפי תאריך בלבד — עכשיו הוא נאכף בנתונים עצמם.
-BOT_VERSION = "3.12.0"
+BOT_VERSION = "3.13.0"
 PNL_SCALE = "0.75oz-net"        # מה שהשדה pnl מודד בגרסה הזו
 
 DATA_FILE = "/tmp/bot_data.json"
@@ -2704,14 +2704,11 @@ def m4v_scan(data, h1):
                                     direction="קנייה" if d == 1 else "מכירה",
                                     entry=pos["e"], stop=pos["stop"], target=pos["tgt"], box=round(pbox, 2)))
                     send_telegram(
-                        f"{M4_SIGNAL_OPEN}\n"
-                        f"<b>שיטה 4{name} · {'קנייה' if d == 1 else 'מכירה'}</b> · #{sid}\n"
-                        f"Renko {pbox:.1f}$ ({mult}×ATR · {conf} לבנים)\n\n"
-                        f"כניסה (Stop)  <b>{pos['e']:.2f}</b>\n"
-                        f"סטופ   {pos['stop']:.2f}\n"
-                        f"יעד    {pos['tgt']:.2f}\n\n"
-                        f"<i>מעקב בלבד. תוצאה נמדדת ברמת הפקודה, סטופ/יעד לפי המחיר בתוך השעה.</i>\n"
-                        f"{M4_SIGNAL_CLOSE}")
+                        f"{METHOD_MARK[4]} <b>שיטה 4{name} #{sid} — הפקודה מולאה</b>\n"
+                        f"{'קנייה' if d == 1 else 'מכירה'} ב-{pos['e']:.2f} · "
+                        f"סטופ {pos['stop']:.2f} · יעד {pos['tgt']:.2f}\n"
+                        f"<i>מעקב בלבד.</i>\n{M4_SIGNAL_CLOSE}")
+                    st["announced"] = None
                     changed = True
                     # בנר המילוי: אם הנר נגע בסטופ — סופרים סטופ (פסימי; אין לנו את הסדר בתוך השעה).
                     # יעד בנר המילוי לא נספר.
@@ -2767,6 +2764,28 @@ def m4v_scan(data, h1):
             st["last_bar"] = b["t"].isoformat()
             changed = True
 
+        # 5) 3.13.0: הודעה מראש — רמת הפקודה לשעה הבאה, רק אם השתנתה
+        pend = st.get("pend")
+        if fresh and pend and st.get("pos") is None:
+            key = [list(x) for x in pend]
+            if key != st.get("announced"):
+                pb = st.get("pend_box", 0)
+                lines = []
+                for d, lvl in pend:
+                    stp = lvl - d * M4V_STOP_BOX * pb
+                    tgt = lvl + d * M4V_TGT_BOX * pb
+                    lines.append(f"{'Buy Stop' if d == 1 else 'Sell Stop'}  <b>{lvl:.2f}</b>\n"
+                                 f"סטופ {stp:.2f} · יעד {tgt:.2f}")
+                prev = st.get("announced")
+                send_telegram(
+                    f"{M4_SIGNAL_OPEN}\n"
+                    f"<b>⏳ שיטה 4{name} — {'עדכון פקודה' if prev else 'הצב פקודה'}</b>\n"
+                    f"Renko {pb:.1f}$ ({mult}×ATR)\n\n" + "\n".join(lines) + "\n\n"
+                    f"<i>{'מבטל את הפקודה הקודמת. ' if prev else ''}"
+                    f"בתוקף עד ההודעה הבאה. מעקב בלבד.</i>\n{M4_SIGNAL_CLOSE}")
+                st["announced"] = key
+                changed = True
+
     if len(log) > 600:
         data["m4v_signals"] = log[-600:]
     if changed:
@@ -2799,12 +2818,44 @@ def _renko_new_bricks(state, closes):
     return out
 
 
-def renko_scan(data, h1):
-    """שיטה 1 — Renko קופסה-קטנה. מעקב בלבד (RENKO_LIVE=False).
+def _renko_close_pos(data, log, pos, px, reason, now):
+    """סוגר פוזיציה של שיטה 1 במחיר px ושולח הודעה. מחזיר None."""
+    pnl_pts = (px - pos["entry"]) if pos["dir"] == 1 else (pos["entry"] - px)
+    pnl_pts -= SPREAD_POINTS
+    pnl_ils = points_to_ils(abs(pnl_pts)) * (1 if pnl_pts >= 0 else -1)
+    icon = "✅" if pnl_pts > 0 else ("➖" if reason == "תפוגה" else "🛑")
+    for rec in reversed(log):
+        if rec.get("id") == pos["id"]:
+            rec.update(status="closed", exit=round(px, 2), reason=reason,
+                       pnl=round(pnl_pts, 2), close_time=now.isoformat())
+            break
+    real = [r for r in log if r.get("status") == "closed" and r.get("acct") == "real"]
+    wins = sum(1 for r in real if (r.get("pnl") or 0) > 0)
+    tot = sum(r.get("pnl") or 0 for r in real)
+    send_telegram(
+        f"{METHOD_MARK[1]} <b>עסקה שיטה 1 #{pos['id']} — {reason}</b>\n"
+        f"{'קנייה' if pos['dir']==1 else 'מכירה'} · Renko {RENKO_BOX}$\n"
+        f"כניסה {pos['entry']:.2f} → יציאה {px:.2f}  ({pnl_pts:+.2f}$ אחרי ספרד)  {icon}\n"
+        f"<b>{pnl_ils:+.2f} ש\"ח</b> ({POSITION_SIZE_OZ}oz) · {pos.get('held', 0)} לבנים\n\n"
+        f"מצטבר שיטה 1 (מחיר אמיתי, מ-3.13.0): {len(real)} סגורות · "
+        f"{(100*wins/len(real) if real else 0):.0f}% · {tot:+.2f}$\n"
+        f"{RENKO_SIGNAL_CLOSE}"
+    )
+    return None
 
-    משתמש בנרות ה-H1 ש-tf_scan כבר משך — אפס קריאות API נוספות.
-    נבדק (tools/renko_scalp.py): קירוב מרזולוציה גסה שומר ~93% מהרווח
-    ואף מעלה את אחוז ההצלחה, כי הוא מסנן רעש תוך-שעתי.
+
+def renko_scan(data, h1):
+    """שיטה 1 — Renko 3$. מעקב בלבד (RENKO_LIVE=False).
+
+    האיתות עצמו לא השתנה: 2 לבנים רצופות לפי סגירות H1.
+    3.13.0 — החישוב במחיר אמיתי (DECISIONS §44):
+      • כניסה = המחיר בזמן ששולחים את ההודעה (סגירת הנר החי), לא מחיר הלבנה.
+        רמת הלבנה נשמרת בשדה brick_level להשוואה.
+      • סטופ/יעד = הרמות שבהודעה (לפי הלבנה), נבדקים בכל סריקה לפי ה-High/Low
+        של הנרות מאז הכניסה — לא רק בסגירת שעה. סטופ קודם אם שניהם נגעו (פסימי).
+      • תפוגה: אחרי RENKO_MAX_HOLD לבנים, במחיר הנוכחי.
+      • ספרד מנוכה. רשומות חדשות מסומנות acct="real".
+    אפס קריאות API נוספות.
     """
     if not h1 or len(h1) < 50:
         return
@@ -2812,6 +2863,8 @@ def renko_scan(data, h1):
     state = data.setdefault("renko_state", {})
     log = data.setdefault("renko_signals", [])
     now = now_il().replace(tzinfo=None)
+    live = h1[-1]["c"]                       # המחיר הנוכחי (הנר החי)
+    changed = False
 
     # רק נרות שנסגרו — הנר האחרון עדיין נבנה
     closed = [b for b in h1 if b["t"] + datetime.timedelta(hours=1) <= now]
@@ -2828,92 +2881,84 @@ def renko_scan(data, h1):
         print(f"[RENKO] אתחול — ייחוס {state['ref']:.2f}", flush=True)
         return
 
-    fresh = [b for b in closed if b["t"].isoformat() > last_seen]
-    if not fresh:
-        return
-    state["last_bar"] = closed[-1]["t"].isoformat()
-
-    bricks = _renko_new_bricks(state, [b["c"] for b in fresh])
-    if not bricks:
-        return
-
-    dirs = state.get("dirs") or []
     pos = state.get("pos")
-    changed = False
+    # פוזיציה ישנה (לפני 3.13.0) — נסגרת פעם אחת במחיר הנוכחי, כדי להתחיל נקי
+    if pos and pos.get("acct") != "real":
+        pos = _renko_close_pos(data, log, pos, live, "מעבר לחישוב אמיתי", now)
+        changed = True
 
-    for bdir, bpx in bricks:
-        dirs.append(bdir)
-        dirs = dirs[-10:]
-
-        # ── פוזיציה פתוחה: בודקים יציאה לפני כניסה חדשה ──
+    # ── 1) סטופ/יעד בכל סריקה, לפי המחיר בפועל מאז הכניסה ──
+    if pos:
+        bar_t = datetime.datetime.fromisoformat(pos["bar_t"])
+        seen_t = datetime.datetime.fromisoformat(pos.get("seen_t", pos["bar_t"]))
+        for bb in h1:
+            if bb["t"] < seen_t:
+                continue
+            hi, lo = bb["h"], bb["l"]
+            if bb["t"] == bar_t:
+                # נר הכניסה: רק מה שנקבע אחרי הכניסה נחשב
+                hi = hi if hi > pos["hi0"] else pos["entry"]
+                lo = lo if lo < pos["lo0"] else pos["entry"]
+            d = pos["dir"]
+            hit_stop = (lo <= pos["stop"]) if d == 1 else (hi >= pos["stop"])
+            hit_tgt = (hi >= pos["target"]) if d == 1 else (lo <= pos["target"])
+            if hit_stop:
+                pos = _renko_close_pos(data, log, pos, pos["stop"], "סטופ", now); changed = True; break
+            if hit_tgt:
+                pos = _renko_close_pos(data, log, pos, pos["target"], "יעד", now); changed = True; break
         if pos:
-            pos["held"] = pos.get("held", 0) + 1
-            reason = None
-            if pos["dir"] == 1:
-                if bpx <= pos["stop"]:   reason = "סטופ"
-                elif bpx >= pos["target"]: reason = "יעד"
-            else:
-                if bpx >= pos["stop"]:   reason = "סטופ"
-                elif bpx <= pos["target"]: reason = "יעד"
-            if reason is None and pos["held"] >= RENKO_MAX_HOLD:
-                reason = "תפוגה"
-            if reason:
-                pnl_pts = (bpx - pos["entry"]) if pos["dir"] == 1 else (pos["entry"] - bpx)
-                pnl_ils = points_to_ils(pnl_pts) * (1 if pnl_pts >= 0 else -1)
-                icon = "✅" if pnl_pts > 0 else ("➖" if reason == "תפוגה" else "🛑")
-                for rec in reversed(log):
-                    if rec.get("status") == "open":
-                        rec.update(status="closed", exit=round(bpx, 2), reason=reason,
-                                   pnl=round(pnl_pts, 2), close_time=now.isoformat())
-                        break
-                closed_recs = [r for r in log if r.get("status") == "closed"]
-                wins = sum(1 for r in closed_recs if (r.get("pnl") or 0) > 0)
-                tot = sum(r.get("pnl") or 0 for r in closed_recs)
-                send_telegram(
-                    f"{METHOD_MARK[1]} <b>עסקה שיטה 1 #{pos['id']} — {reason}</b>\n"
-                    f"{'קנייה' if pos['dir']==1 else 'מכירה'} · Renko {RENKO_BOX}$\n"
-                    f"כניסה {pos['entry']:.2f} → יציאה {bpx:.2f}  "
-                    f"({pnl_pts:+.2f}$)  {icon}\n"
-                    f"<b>{pnl_ils:+.2f} ש\"ח</b> ({POSITION_SIZE_OZ}oz) · "
-                    f"{pos['held']} לבנים\n\n"
-                    f"מצטבר שיטה 1: {len(closed_recs)} סגורות · "
-                    f"{(100*wins/len(closed_recs) if closed_recs else 0):.0f}% · "
-                    f"{tot:+.2f}$\n"
-                    f"{RENKO_SIGNAL_CLOSE}"
-                )
-                pos = None
-                changed = True
+            # הנר החי עוד ייבדק שוב בסריקה הבאה (ה-High/Low שלו עוד משתנים)
+            pos["seen_t"] = h1[-1]["t"].isoformat()
 
-        # ── אין פוזיציה: בודקים כניסה ──
-        if not pos and len(dirs) >= RENKO_CONFIRM:
-            recent = dirs[-RENKO_CONFIRM:]
-            if all(d == 1 for d in recent) or all(d == -1 for d in recent):
-                d = recent[0]
-                entry = bpx
-                stop = entry - RENKO_STOP * RENKO_BOX if d == 1 else entry + RENKO_STOP * RENKO_BOX
-                target = entry + RENKO_TARGET * RENKO_BOX if d == 1 else entry - RENKO_TARGET * RENKO_BOX
-                sid = renko_signal_id(data)
-                pos = {"id": sid, "dir": d, "entry": entry, "stop": stop,
-                       "target": target, "held": 0, "opened": now.isoformat()}
-                log.append({"id": sid, "time": now.isoformat(), "status": "open",
-                            "direction": "קנייה" if d == 1 else "מכירה",
-                            "entry": round(entry, 2), "stop": round(stop, 2),
-                            "target": round(target, 2), "box": RENKO_BOX})
-                send_telegram(
-                    f"{RENKO_SIGNAL_OPEN}\n"
-                    f"<b>{'קנייה' if d==1 else 'מכירה'}</b> · Renko {RENKO_BOX}$ · "
-                    f"{RENKO_CONFIRM} לבנים רצופות · #{sid}\n\n"
-                    f"כניסה  <b>{entry:.2f}</b>\n"
-                    f"סטופ   {stop:.2f}   ({-RENKO_STOP*RENKO_BOX:+.1f}$)\n"
-                    f"יעד    {target:.2f}   ({RENKO_TARGET*RENKO_BOX:+.1f}$)\n"
-                    f"סיכון {points_to_ils(RENKO_STOP*RENKO_BOX):.0f} ש\"ח · {POSITION_SIZE_OZ}oz\n\n"
-                    f"<i>מעקב בלבד — לא למסחר אמיתי. נבנה להחלפת שיטה 1 הישנה; "
-                    f"נאסף מדגם חי לפני החלטה.</i>\n"
-                    f"{RENKO_SIGNAL_CLOSE}"
-                )
-                changed = True
+    # ── 2) לבנים חדשות מנרות שנסגרו ──
+    fresh = [b for b in closed if b["t"].isoformat() > last_seen]
+    if fresh:
+        state["last_bar"] = closed[-1]["t"].isoformat()
+        bricks = _renko_new_bricks(state, [b["c"] for b in fresh])
+        dirs = state.get("dirs") or []
+        for bdir, bpx in bricks:
+            dirs.append(bdir)
+            dirs = dirs[-10:]
+            if pos:
+                pos["held"] = pos.get("held", 0) + 1
+                if pos["held"] >= RENKO_MAX_HOLD:
+                    pos = _renko_close_pos(data, log, pos, live, "תפוגה", now)
+                    changed = True
+                continue
+            # ── כניסה: 2 לבנים רצופות — במחיר הנוכחי ──
+            if len(dirs) >= RENKO_CONFIRM:
+                recent = dirs[-RENKO_CONFIRM:]
+                if all(x == recent[0] for x in recent):
+                    d = recent[0]
+                    lvl = bpx
+                    stop = lvl - RENKO_STOP * RENKO_BOX if d == 1 else lvl + RENKO_STOP * RENKO_BOX
+                    target = lvl + RENKO_TARGET * RENKO_BOX if d == 1 else lvl - RENKO_TARGET * RENKO_BOX
+                    entry = live
+                    late = (entry - lvl) * d
+                    sid = renko_signal_id(data)
+                    pos = {"id": sid, "dir": d, "entry": entry, "brick_level": lvl, "stop": stop,
+                           "target": target, "held": 0, "opened": now.isoformat(), "acct": "real",
+                           "bar_t": h1[-1]["t"].isoformat(), "hi0": h1[-1]["h"], "lo0": h1[-1]["l"]}
+                    log.append({"id": sid, "time": now.isoformat(), "status": "open", "acct": "real",
+                                "direction": "קנייה" if d == 1 else "מכירה",
+                                "entry": round(entry, 2), "brick_level": round(lvl, 2),
+                                "late": round(late, 2), "stop": round(stop, 2),
+                                "target": round(target, 2), "box": RENKO_BOX})
+                    send_telegram(
+                        f"{RENKO_SIGNAL_OPEN}\n"
+                        f"<b>{'קנייה' if d==1 else 'מכירה'}</b> · Renko {RENKO_BOX}$ · "
+                        f"{RENKO_CONFIRM} לבנים רצופות · #{sid}\n\n"
+                        f"מחיר עכשיו  <b>{entry:.2f}</b>  (רמת הלבנה {lvl:.2f}, איחור {late:+.2f}$)\n"
+                        f"סטופ   {stop:.2f}\n"
+                        f"יעד    {target:.2f}\n"
+                        f"סיכון {points_to_ils(abs(entry - stop)):.0f} ש\"ח · {POSITION_SIZE_OZ}oz\n\n"
+                        f"<i>מעקב בלבד. התוצאה נמדדת מהמחיר עכשיו, סטופ/יעד לפי המחיר בפועל.</i>\n"
+                        f"{RENKO_SIGNAL_CLOSE}"
+                    )
+                    changed = True
+        state["dirs"] = dirs
+        changed = True
 
-    state["dirs"] = dirs
     state["pos"] = pos
     if len(log) > 400:
         data["renko_signals"] = log[-400:]
