@@ -191,7 +191,13 @@ M4_ENABLED      = False   # שיטה 4 הישנה (פריצת טווח) — הצ
 # עם החלקה 0.5$ שתיהן סביב אפס — המילוי ברמה (פקודת Stop מראש) הוא התנאי.
 # B (לבנה אחת, שני הצדדים) הוסרה 23/09: התוצאה תלויה בסדר הנגיעה בתוך השעה (+13.8 מול -1.6₪).
 M4V_ENABLED     = True
-M4V_VARIANTS    = [("A", 0.4, 2), ("C", 0.5, 2)]
+M4V_VARIANTS    = [("C", 0.5, 2)]   # 3.16.0: 4A הוחלפה בטווח האסייתי (ASIA_*)
+# 3.16.0: שיטה 4A — פריצת הטווח האסייתי (DECISIONS §59). מעקב בלבד.
+# טווח = High/Low של 00:00–06:59 UTC. אחרי 07:00 UTC: Buy Stop בשיא + Sell Stop בשפל, פעילות עד 15:59 UTC.
+# הראשונה שמתמלאת — השנייה מבוטלת. סטופ = הצד השני של הטווח, יעד = גודל הטווח, סגירה ב-20:00 UTC.
+# בקטסט 3 שנים (M15): ~1 ביום, 54%, +9.8₪/עסקה עם החלקה 0.5$, t=1.85 — חיובי כל השנים, לא מובהק.
+ASIA_ENABLED    = True
+ASIA_MIN_RANGE  = 5.0     # דולר — טווח קטן מזה: אין פקודות
 M4V_STOP_BOX    = 3       # סטופ בקופסאות
 M4V_TGT_BOX     = 6       # יעד בקופסאות
 M4V_MAX_BRICKS  = 6       # תפוגה
@@ -303,7 +309,7 @@ def backup_window_txt(now):
 # סקאלת סיכון 40 ש"ח). רשומה ישנה וחדשה נראות זהות ואי אפשר להבדיל
 # ביניהן בדיעבד. הכלל "אל תערבב נתונים משתי סקאלות" תוחזק עד היום
 # לפי תאריך בלבד — עכשיו הוא נאכף בנתונים עצמם.
-BOT_VERSION = "3.15.0"
+BOT_VERSION = "3.16.0"
 PNL_SCALE = "0.75oz-net"        # מה שהשדה pnl מודד בגרסה הזו
 
 DATA_FILE = "/tmp/bot_data.json"
@@ -2797,6 +2803,143 @@ def m4v_scan(data, h1):
         save_data(data)
 
 
+def asia_scan(data, h1):
+    """שיטה 4A (3.16.0) — פריצה ראשונה של הטווח האסייתי. מעקב בלבד. 0 קריאות API נוספות.
+
+    זמנים ב-UTC (הנרות בבוט בשעון ישראל — מומרים). בכל סריקה:
+      1. אחרי שנר 06:00-07:00 UTC נסגר: טווח = High/Low של 00:00–06:59 UTC → הודעת "הצב פקודות".
+      2. 07:00–15:59 UTC: מילוי — הצד הראשון שנגע. אם שני הצדדים נגעו בין שתי סריקות — נספר הפסד מלא (פסימי).
+      3. אחרי מילוי: סטופ/יעד לפי High/Low שנקבעו אחרי המילוי (כמו 4C). 20:00 UTC — סגירה במחיר הנוכחי.
+    """
+    if not ASIA_ENABLED or not h1:
+        return
+    now_utc = datetime.datetime.now(UTC_TZ).replace(tzinfo=None)
+    try:
+        now_utc = now_il().astimezone(UTC_TZ).replace(tzinfo=None)
+    except Exception:
+        pass
+    def to_utc(t):
+        return t.replace(tzinfo=IL_TZ).astimezone(UTC_TZ).replace(tzinfo=None)
+    bars = [dict(b, tu=to_utc(b["t"])) for b in h1 if b["h"] > b["l"]]
+    if not bars:
+        return
+    day = now_utc.date()
+    d0 = datetime.datetime.combine(day, datetime.time(0))
+    t7, t16, t20 = d0 + datetime.timedelta(hours=7), d0 + datetime.timedelta(hours=16), d0 + datetime.timedelta(hours=20)
+    st = data.setdefault("asia_state", {})
+    log = data.setdefault("asia_signals", [])
+    changed = False
+    live = h1[-1]["c"]
+
+    # יום חדש — איפוס
+    if st.get("date") != day.isoformat():
+        st.clear(); st["date"] = day.isoformat(); st["status"] = "wait"; changed = True
+
+    # 1) הטווח — אחרי שנר 06:00 UTC נסגר
+    if st["status"] == "wait" and now_utc >= t7 and now_utc < t16:
+        asia = [b for b in bars if d0 <= b["tu"] < t7]
+        if len(asia) >= 5:
+            rh = max(b["h"] for b in asia); rl = min(b["l"] for b in asia); R = rh - rl
+            if R < ASIA_MIN_RANGE:
+                st["status"] = "done"; st["note"] = f"טווח {R:.2f}$ קטן מדי"
+            else:
+                st.update(status="pending", rh=round(rh, 2), rl=round(rl, 2), R=round(R, 2))
+                send_telegram(
+                    f"{M4_SIGNAL_OPEN}\n"
+                    f"<b>⏳ שיטה 4A — טווח אסייתי · הצב שתי פקודות</b>\n"
+                    f"טווח {rl:.2f} – {rh:.2f}  ({R:.2f}$)\n\n"
+                    f"Buy Stop  <b>{rh:.2f}</b>  · סטופ {rl:.2f} · יעד {rh + R:.2f}\n"
+                    f"Sell Stop <b>{rl:.2f}</b>  · סטופ {rh:.2f} · יעד {rl - R:.2f}\n\n"
+                    f"<i>הראשונה שמתמלאת — לבטל את השנייה. בתוקף עד "
+                    f"{t16.replace(tzinfo=UTC_TZ).astimezone(IL_TZ):%H:%M}. "
+                    f"סגירה ב-{t20.replace(tzinfo=UTC_TZ).astimezone(IL_TZ):%H:%M}. מעקב בלבד.</i>\n"
+                    f"{M4_SIGNAL_CLOSE}")
+            changed = True
+        elif now_utc >= t7 + datetime.timedelta(hours=2):
+            st["status"] = "done"; st["note"] = "אין מספיק נרות"; changed = True
+
+    # 2) מילוי
+    if st.get("status") == "pending":
+        chk = datetime.datetime.fromisoformat(st.get("chk", t7.isoformat()))
+        for b in bars:
+            if b["tu"] < chk or b["tu"] < t7 or b["tu"] >= t16:
+                continue
+            up = b["h"] >= st["rh"]; dn = b["l"] <= st["rl"]
+            if up and dn:
+                sid = int(data.get("asia_seq", 0)) + 1; data["asia_seq"] = sid
+                pnl = -st["R"] - SPREAD_POINTS
+                log.append(dict(id=sid, time=now_il().replace(tzinfo=None).isoformat(), status="closed",
+                                direction="שני הצדדים", entry=None, exit=None, reason="שני הצדדים נגעו",
+                                pnl=round(pnl, 2), range=st["R"]))
+                send_telegram(f"{METHOD_MARK[4]} <b>שיטה 4A #{sid} — שני הצדדים נגעו בין סריקות</b>\n"
+                              f"נספר כהפסד מלא (זהיר): {pnl:+.2f}$\n{M4_SIGNAL_CLOSE}")
+                st["status"] = "done"; changed = True
+                break
+            if up or dn:
+                d = 1 if up else -1
+                lvl = st["rh"] if d == 1 else st["rl"]
+                e = max(lvl, b["o"]) if d == 1 else min(lvl, b["o"])
+                sid = int(data.get("asia_seq", 0)) + 1; data["asia_seq"] = sid
+                pos = dict(id=sid, d=d, e=round(e, 2),
+                           stop=st["rl"] if d == 1 else st["rh"],
+                           tgt=round(e + d * st["R"], 2),
+                           bar_t=b["tu"].isoformat(), hi0=b["h"], lo0=b["l"])
+                log.append(dict(id=sid, time=now_il().replace(tzinfo=None).isoformat(), status="open",
+                                direction="קנייה" if d == 1 else "מכירה", entry=pos["e"],
+                                stop=pos["stop"], target=pos["tgt"], range=st["R"]))
+                send_telegram(f"{METHOD_MARK[4]} <b>שיטה 4A #{sid} — {'Buy' if d == 1 else 'Sell'} Stop מולאה</b>\n"
+                              f"{'קנייה' if d == 1 else 'מכירה'} ב-{pos['e']:.2f} · סטופ {pos['stop']:.2f} · "
+                              f"יעד {pos['tgt']:.2f}\n<b>לבטל את הפקודה השנייה.</b>\n"
+                              f"<i>מעקב בלבד.</i>\n{M4_SIGNAL_CLOSE}")
+                st.update(status="open", pos=pos); changed = True
+                break
+        if st.get("status") == "pending":
+            st["chk"] = max(t7, bars[-1]["tu"]).isoformat()   # לעולם לא לפני 07:00 UTC (נר הטווח עצמו)
+            if now_utc >= t16:
+                st["status"] = "done"; st["note"] = "לא התמלאה"; changed = True
+
+    # 3) ניהול פוזיציה
+    if st.get("status") == "open":
+        pos = st["pos"]
+        seen = datetime.datetime.fromisoformat(pos.get("seen", pos["bar_t"]))
+        reason = px = None
+        for b in bars:
+            if b["tu"] < seen:
+                continue
+            hi, lo = b["h"], b["l"]
+            if b["tu"].isoformat() == pos["bar_t"]:
+                hi = hi if hi > pos["hi0"] else pos["e"]
+                lo = lo if lo < pos["lo0"] else pos["e"]
+            d = pos["d"]
+            if (d == 1 and lo <= pos["stop"]) or (d == -1 and hi >= pos["stop"]):
+                reason, px = "סטופ", pos["stop"]; break
+            if (d == 1 and hi >= pos["tgt"]) or (d == -1 and lo <= pos["tgt"]):
+                reason, px = "יעד", pos["tgt"]; break
+        if reason is None and now_utc >= t20:
+            reason, px = "סגירה בזמן", round(live, 2)
+        if reason:
+            pts = pos["d"] * (px - pos["e"]) - SPREAD_POINTS
+            for rec in reversed(log):
+                if rec.get("id") == pos["id"]:
+                    rec.update(status="closed", exit=px, reason=reason, pnl=round(pts, 2),
+                               close_time=now_il().replace(tzinfo=None).isoformat())
+                    break
+            cl = [r for r in log if r.get("status") == "closed"]
+            w = sum(1 for r in cl if (r.get("pnl") or 0) > 0)
+            send_telegram(f"{METHOD_MARK[4]} <b>שיטה 4A #{pos['id']} — {reason}</b>\n"
+                          f"{pos['e']:.2f} → {px:.2f}  ({pts:+.2f}$ אחרי ספרד)\n"
+                          f"מצטבר 4A (טווח אסייתי): {len(cl)} · {100 * w / len(cl):.0f}% · "
+                          f"{sum(r.get('pnl') or 0 for r in cl):+.2f}$\n{M4_SIGNAL_CLOSE}")
+            st["status"] = "done"; st.pop("pos", None); changed = True
+        else:
+            pos["seen"] = bars[-1]["tu"].isoformat()
+
+    if len(log) > 400:
+        data["asia_signals"] = log[-400:]
+    if changed:
+        save_data(data)
+
+
 def renko_signal_id(data):
     """מספר רץ לאיתות שיטה 1, מונה מתמיד ב-data (לא אינדקס במערך)."""
     seq = int(data.get("renko_seq", 0)) + 1
@@ -4950,7 +5093,8 @@ def main():
         "צפי: 1-2 איתותים בשבוע. שקט = תקין.\n\n"
         "🟥 <b>שיטה 1 — Renko 3$:</b> מעקב, שולחת איתותים.\n"
         "🟧 <b>שיטה 3 — 6H:</b> מעקב.\n"
-        "🟦 <b>שיטה 4A / 4C — Renko לפי ATR:</b> מעקב, כניסה בפקודת Stop ברמה.\n"
+        "🟦 <b>שיטה 4A — טווח אסייתי:</b> מעקב, 2 פקודות ב-~10:00, עד עסקה ביום.\n"
+        "🟦 <b>שיטה 4C — Renko לפי ATR:</b> מעקב, כניסה בפקודת Stop ברמה.\n"
         "(שיטה 1 הישנה ושיטה 4 הישנה — מושבתות)\n\n" +
         "💡 /backtest | /h1 | /h2 | /h3 | /h8 | /h9 | /shadow2 | /reset | /status | /mfe | /cross | /slow\n"
         f"{storage_line}"
@@ -5013,6 +5157,7 @@ def main():
                             if _h1:
                                 if M4_ENABLED: m4_scan(data, _h1)
                                 m4v_scan(data, _h1)
+                                asia_scan(data, _h1)
                         except Exception as _e:
                             print(f"[M4] שגיאה: {_e}", flush=True)
                     except Exception as e:
