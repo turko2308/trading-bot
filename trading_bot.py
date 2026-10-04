@@ -309,7 +309,7 @@ def backup_window_txt(now):
 # סקאלת סיכון 40 ש"ח). רשומה ישנה וחדשה נראות זהות ואי אפשר להבדיל
 # ביניהן בדיעבד. הכלל "אל תערבב נתונים משתי סקאלות" תוחזק עד היום
 # לפי תאריך בלבד — עכשיו הוא נאכף בנתונים עצמם.
-BOT_VERSION = "3.16.0"
+BOT_VERSION = "3.17.0"
 PNL_SCALE = "0.75oz-net"        # מה שהשדה pnl מודד בגרסה הזו
 
 DATA_FILE = "/tmp/bot_data.json"
@@ -2644,6 +2644,89 @@ def _m4v_atr(bars, period=14):
     return sum(trs[-period:]) / period
 
 
+# ── 3.17.0: פורמט הודעות אחיד + ש"ח לפי גודל פוזיציה ───────────────────
+def _ils(pts):
+    """$ לאונקיה → ש"ח בגודל הפוזיציה, עם סימן."""
+    return (1 if pts >= 0 else -1) * points_to_ils(pts)
+
+
+def fmt_entry(mark, title, d, entry, target, stop, entry_note=""):
+    risk = points_to_ils(abs(entry - stop))
+    return (f"{mark} <b>{title}</b>\n"
+            f"כיוון:  {'קנייה' if d == 1 else 'מכירה'}\n"
+            f"כניסה:  {entry:.2f}{('  (' + entry_note + ')') if entry_note else ''}\n"
+            f"יעד:    {target:.2f}\n"
+            f"סטופ:   {stop:.2f}\n"
+            f"סיכון:  {risk:.0f} ש\"ח · {POSITION_SIZE_OZ}oz")
+
+
+def fmt_exit(mark, title, entry, exitp, pts, n_closed, winrate, total_pts):
+    return (f"{mark} <b>{title}</b>\n"
+            f"כניסה:  {entry:.2f}\n"
+            f"יציאה:  {exitp:.2f}\n"
+            f"תוצאה:  {_ils(pts):+.0f} ש\"ח\n"
+            f"מצטבר:  {n_closed} עסקאות · {winrate:.0f}% · {_ils(total_pts):+.0f} ש\"ח")
+
+
+# ── 3.17.0: איסוף גמא יומי (GLD, QuantWheel) — איסוף נתונים בלבד ─────────────
+GEX_ENABLED = True
+GEX_URL = "https://quantwheel.com/tools/gex/gld"
+GEX_AFTER_IL_HOUR = 1          # אחרי 01:00 ישראל (הנתונים "as of" ~17:30 ניו יורק)
+
+
+def _gex_tag(data):
+    g = data.get("gex_now") or {}
+    return {"gex_regime": g.get("regime"), "gex_date": g.get("date")} if g else {"gex_regime": None}
+
+
+def gex_scan(data):
+    """פעם ביום: קורא את רמות הגמא של GLD ושומר ב-data["gex_log"]. 0 קריאות Twelve Data.
+    regime = "negative" אם המחיר מתחת לקו ההיפוך (התנודות מועצמות), אחרת "positive". סך הגמא נשמר בנפרד (net_gex)."""
+    if not GEX_ENABLED:
+        return
+    now = now_il()
+    if now.hour < GEX_AFTER_IL_HOUR or now.hour >= 12:
+        return
+    today = now.date().isoformat()
+    if data.get("gex_try_date") == today:
+        return
+    data["gex_try_date"] = today
+    import re as _re
+    try:
+        r = requests.get(GEX_URL, timeout=20, headers={"User-Agent": "Mozilla/5.0 (gold100bot data logger)"})
+        txt = _re.sub(r"<[^>]+>", " ", r.text)
+        txt = _re.sub(r"\s+", " ", txt)
+        num = r"\$\s*([\d,]+(?:\.\d+)?)"
+        def grab(label):
+            m = _re.search(label + r"\s*" + num, txt)
+            return float(m.group(1).replace(",", "")) if m else None
+        spot, cw, pw, flip = grab("Spot"), grab("Call wall"), grab("Put wall"), grab("Gamma flip")
+        mg = _re.search(r"Net GEX\s*(-?)\$?\s*([\d,]+(?:\.\d+)?)\s*([KMB]?)\s*(positive|negative)", txt)
+        ma = _re.search(r"Data as of ([A-Za-z]{3,9} \d{1,2}, \d{4},? [\d:]+ ?[AP]M ?E[DS]T)", txt)
+        if None in (spot, cw, pw, flip) or not mg:
+            raise ValueError("לא נמצאו כל השדות בדף")
+        net = float(mg.group(2).replace(",", "")) * {"": 1, "K": 1e3, "M": 1e6, "B": 1e9}[mg.group(3)]
+        if mg.group(1) == "-" or mg.group(4) == "negative":
+            net = -abs(net)
+        regime = "negative" if spot < flip else "positive"   # הגדרה מקובלת: מתחת לקו ההיפוך = גמא שלילית
+        rec = {"date": today, "as_of": ma.group(1) if ma else None, "spot": spot, "call_wall": cw,
+               "put_wall": pw, "flip": flip, "net_gex": net, "regime": regime}
+        log = data.setdefault("gex_log", [])
+        if not log or log[-1].get("as_of") != rec["as_of"] or rec["as_of"] is None:
+            log.append(rec)
+        data["gex_now"] = rec
+        data["gex_fail_count"] = 0
+        save_data(data)
+        print(f"[GEX] {rec}", flush=True)
+    except Exception as e:
+        data["gex_fail_count"] = int(data.get("gex_fail_count", 0)) + 1
+        save_data(data)
+        print(f"[GEX] כשל: {e}", flush=True)
+        if data["gex_fail_count"] in (1, 3, 7):
+            send_telegram(f"⚠️ איסוף גמא נכשל ({data['gex_fail_count']} ימים ברצף): {str(e)[:120]}\n"
+                          f"הבוט ממשיך לעבוד כרגיל — רק האיסוף לא רץ.")
+
+
 def _m4v_close(data, log, name, pos, px, reason, now):
     pts = pos["d"] * (px - pos["e"]) - SPREAD_POINTS
     for rec in reversed(log):
@@ -2653,11 +2736,8 @@ def _m4v_close(data, log, name, pos, px, reason, now):
             break
     cl = [r for r in log if r.get("variant") == name and r.get("status") == "closed"]
     w = sum(1 for r in cl if r["pnl"] > 0)
-    send_telegram(
-        f"{METHOD_MARK[4]} <b>שיטה 4{name} #{pos['id']} — {reason}</b>\n"
-        f"{pos['e']:.2f} → {px:.2f}  ({pts:+.2f}$ אחרי ספרד)\n"
-        f"מצטבר 4{name}: {len(cl)} · {100 * w / len(cl):.0f}% · "
-        f"{sum(r['pnl'] for r in cl):+.2f}$\n{M4_SIGNAL_CLOSE}")
+    send_telegram(fmt_exit(METHOD_MARK[4], f"שיטה 4{name} · #{pos['id']} · {reason}", pos["e"], px, pts,
+                           len(cl), 100 * w / len(cl), sum(r["pnl"] for r in cl)))
 
 
 def m4v_scan(data, h1):
@@ -2738,12 +2818,10 @@ def m4v_scan(data, h1):
                        t=b["t"].isoformat(), bar_t=b["t"].isoformat(), hi0=b["h"], lo0=b["l"])
             log.append(dict(id=sid, variant=name, time=now.isoformat(), status="open",
                             direction="קנייה" if d == 1 else "מכירה",
-                            entry=pos["e"], stop=pos["stop"], target=pos["tgt"], box=round(pbox, 2)))
-            send_telegram(
-                f"{METHOD_MARK[4]} <b>שיטה 4{name} #{sid} — הפקודה מולאה</b>\n"
-                f"{'קנייה' if d == 1 else 'מכירה'} ב-{pos['e']:.2f} · "
-                f"סטופ {pos['stop']:.2f} · יעד {pos['tgt']:.2f}\n"
-                f"<i>מעקב בלבד.</i>\n{M4_SIGNAL_CLOSE}")
+                            entry=pos["e"], stop=pos["stop"], target=pos["tgt"], box=round(pbox, 2),
+                            **_gex_tag(data)))
+            send_telegram(fmt_entry(METHOD_MARK[4], f"שיטה 4{name} · #{sid} · הפקודה מולאה", d,
+                                    pos["e"], pos["tgt"], pos["stop"]))
             st.update(pos=pos, pend=None, announced=None)
             changed = True
 
@@ -2782,18 +2860,14 @@ def m4v_scan(data, h1):
             key = [list(x) for x in pend]
             if key != st.get("announced"):
                 pb = st.get("pend_box", 0)
-                lines = []
-                for d, lvl in pend:
-                    lines.append(f"{'Buy Stop' if d == 1 else 'Sell Stop'}  <b>{lvl:.2f}</b>\n"
-                                 f"סטופ {lvl - d * M4V_STOP_BOX * pb:.2f} · "
-                                 f"יעד {lvl + d * M4V_TGT_BOX * pb:.2f}")
                 prev = st.get("announced")
-                send_telegram(
-                    f"{M4_SIGNAL_OPEN}\n"
-                    f"<b>⏳ שיטה 4{name} — {'עדכון פקודה' if prev else 'הצב פקודה'}</b>\n"
-                    f"Renko {pb:.1f}$ ({mult}×ATR)\n\n" + "\n".join(lines) + "\n\n"
-                    f"<i>{'מבטל את הפקודה הקודמת. ' if prev else ''}"
-                    f"בתוקף עד ההודעה הבאה. מעקב בלבד.</i>\n{M4_SIGNAL_CLOSE}")
+                blocks = [fmt_entry(METHOD_MARK[4],
+                                    f"⏳ שיטה 4{name} · {'עדכון פקודה' if prev else 'הצב פקודה'}",
+                                    d, lvl, lvl + d * M4V_TGT_BOX * pb, lvl - d * M4V_STOP_BOX * pb,
+                                    "Buy Stop" if d == 1 else "Sell Stop")
+                          for d, lvl in pend]
+                send_telegram("\n\n".join(blocks) + f"\nלבנה: {pb:.2f}$"
+                              + ("\nמבטל את הפקודה הקודמת." if prev else ""))
                 st["announced"] = key
                 changed = True
 
@@ -2845,15 +2919,11 @@ def asia_scan(data, h1):
             else:
                 st.update(status="pending", rh=round(rh, 2), rl=round(rl, 2), R=round(R, 2))
                 send_telegram(
-                    f"{M4_SIGNAL_OPEN}\n"
-                    f"<b>⏳ שיטה 4A — טווח אסייתי · הצב שתי פקודות</b>\n"
-                    f"טווח {rl:.2f} – {rh:.2f}  ({R:.2f}$)\n\n"
-                    f"Buy Stop  <b>{rh:.2f}</b>  · סטופ {rl:.2f} · יעד {rh + R:.2f}\n"
-                    f"Sell Stop <b>{rl:.2f}</b>  · סטופ {rh:.2f} · יעד {rl - R:.2f}\n\n"
-                    f"<i>הראשונה שמתמלאת — לבטל את השנייה. בתוקף עד "
-                    f"{t16.replace(tzinfo=UTC_TZ).astimezone(IL_TZ):%H:%M}. "
-                    f"סגירה ב-{t20.replace(tzinfo=UTC_TZ).astimezone(IL_TZ):%H:%M}. מעקב בלבד.</i>\n"
-                    f"{M4_SIGNAL_CLOSE}")
+                    fmt_entry(METHOD_MARK[4], "⏳ שיטה 4A · הצב פקודה 1", 1, rh, rh + R, rl, "Buy Stop") + "\n\n"
+                    + fmt_entry(METHOD_MARK[4], "⏳ שיטה 4A · הצב פקודה 2", -1, rl, rl - R, rh, "Sell Stop") + "\n"
+                    f"הראשונה שמתמלאת — לבטל את השנייה. בתוקף עד "
+                    f"{t16.replace(tzinfo=UTC_TZ).astimezone(IL_TZ):%H:%M} · "
+                    f"סגירה {t20.replace(tzinfo=UTC_TZ).astimezone(IL_TZ):%H:%M}")
             changed = True
         elif now_utc >= t7 + datetime.timedelta(hours=2):
             st["status"] = "done"; st["note"] = "אין מספיק נרות"; changed = True
@@ -2871,8 +2941,9 @@ def asia_scan(data, h1):
                 log.append(dict(id=sid, time=now_il().replace(tzinfo=None).isoformat(), status="closed",
                                 direction="שני הצדדים", entry=None, exit=None, reason="שני הצדדים נגעו",
                                 pnl=round(pnl, 2), range=st["R"]))
-                send_telegram(f"{METHOD_MARK[4]} <b>שיטה 4A #{sid} — שני הצדדים נגעו בין סריקות</b>\n"
-                              f"נספר כהפסד מלא (זהיר): {pnl:+.2f}$\n{M4_SIGNAL_CLOSE}")
+                send_telegram(f"{METHOD_MARK[4]} <b>שיטה 4A · #{sid} · שני הצדדים נגעו</b>\n"
+                              f"נספר כהפסד מלא (זהיר)\n"
+                              f"תוצאה:  {_ils(pnl):+.0f} ש\"ח")
                 st["status"] = "done"; changed = True
                 break
             if up or dn:
@@ -2886,11 +2957,9 @@ def asia_scan(data, h1):
                            bar_t=b["tu"].isoformat(), hi0=b["h"], lo0=b["l"])
                 log.append(dict(id=sid, time=now_il().replace(tzinfo=None).isoformat(), status="open",
                                 direction="קנייה" if d == 1 else "מכירה", entry=pos["e"],
-                                stop=pos["stop"], target=pos["tgt"], range=st["R"]))
-                send_telegram(f"{METHOD_MARK[4]} <b>שיטה 4A #{sid} — {'Buy' if d == 1 else 'Sell'} Stop מולאה</b>\n"
-                              f"{'קנייה' if d == 1 else 'מכירה'} ב-{pos['e']:.2f} · סטופ {pos['stop']:.2f} · "
-                              f"יעד {pos['tgt']:.2f}\n<b>לבטל את הפקודה השנייה.</b>\n"
-                              f"<i>מעקב בלבד.</i>\n{M4_SIGNAL_CLOSE}")
+                                stop=pos["stop"], target=pos["tgt"], range=st["R"], **_gex_tag(data)))
+                send_telegram(fmt_entry(METHOD_MARK[4], f"שיטה 4A · #{sid} · הפקודה מולאה", d,
+                                        pos["e"], pos["tgt"], pos["stop"]) + "\nלבטל את הפקודה השנייה.")
                 st.update(status="open", pos=pos); changed = True
                 break
         if st.get("status") == "pending":
@@ -2926,10 +2995,8 @@ def asia_scan(data, h1):
                     break
             cl = [r for r in log if r.get("status") == "closed"]
             w = sum(1 for r in cl if (r.get("pnl") or 0) > 0)
-            send_telegram(f"{METHOD_MARK[4]} <b>שיטה 4A #{pos['id']} — {reason}</b>\n"
-                          f"{pos['e']:.2f} → {px:.2f}  ({pts:+.2f}$ אחרי ספרד)\n"
-                          f"מצטבר 4A (טווח אסייתי): {len(cl)} · {100 * w / len(cl):.0f}% · "
-                          f"{sum(r.get('pnl') or 0 for r in cl):+.2f}$\n{M4_SIGNAL_CLOSE}")
+            send_telegram(fmt_exit(METHOD_MARK[4], f"שיטה 4A · #{pos['id']} · {reason}", pos["e"], px, pts,
+                                   len(cl), 100 * w / len(cl), sum(r.get("pnl") or 0 for r in cl)))
             st["status"] = "done"; st.pop("pos", None); changed = True
         else:
             pos["seen"] = bars[-1]["tu"].isoformat()
@@ -2980,15 +3047,8 @@ def _renko_close_pos(data, log, pos, px, reason, now):
     real = [r for r in log if r.get("status") == "closed" and r.get("acct") == "real"]
     wins = sum(1 for r in real if (r.get("pnl") or 0) > 0)
     tot = sum(r.get("pnl") or 0 for r in real)
-    send_telegram(
-        f"{METHOD_MARK[1]} <b>עסקה שיטה 1 #{pos['id']} — {reason}</b>\n"
-        f"{'קנייה' if pos['dir']==1 else 'מכירה'} · Renko {RENKO_BOX}$\n"
-        f"כניסה {pos['entry']:.2f} → יציאה {px:.2f}  ({pnl_pts:+.2f}$ אחרי ספרד)  {icon}\n"
-        f"<b>{pnl_ils:+.2f} ש\"ח</b> ({POSITION_SIZE_OZ}oz) · {pos.get('held', 0)} לבנים\n\n"
-        f"מצטבר שיטה 1 (מחיר אמיתי, מ-3.13.0): {len(real)} סגורות · "
-        f"{(100*wins/len(real) if real else 0):.0f}% · {tot:+.2f}$\n"
-        f"{RENKO_SIGNAL_CLOSE}"
-    )
+    send_telegram(fmt_exit(METHOD_MARK[1], f"שיטה 1 · #{pos['id']} · {reason}", pos["entry"], px, pnl_pts,
+                           len(real), (100 * wins / len(real) if real else 0), tot))
     return None
 
 
@@ -3102,18 +3162,9 @@ def renko_scan(data, h1):
                                 "direction": "קנייה" if d == 1 else "מכירה",
                                 "entry": round(entry, 2), "brick_level": round(lvl, 2),
                                 "late": round(late, 2), "stop": round(stop, 2),
-                                "target": round(target, 2), "box": RENKO_BOX})
-                    send_telegram(
-                        f"{RENKO_SIGNAL_OPEN}\n"
-                        f"<b>{'קנייה' if d==1 else 'מכירה'}</b> · Renko {RENKO_BOX}$ · "
-                        f"{RENKO_CONFIRM} לבנים רצופות · #{sid}\n\n"
-                        f"מחיר עכשיו  <b>{entry:.2f}</b>  (רמת הלבנה {lvl:.2f}, איחור {late:+.2f}$)\n"
-                        f"סטופ   {stop:.2f}\n"
-                        f"יעד    {target:.2f}\n"
-                        f"סיכון {points_to_ils(abs(entry - stop)):.0f} ש\"ח · {POSITION_SIZE_OZ}oz\n\n"
-                        f"<i>מעקב בלבד. התוצאה נמדדת מהמחיר עכשיו, סטופ/יעד לפי המחיר בפועל.</i>\n"
-                        f"{RENKO_SIGNAL_CLOSE}"
-                    )
+                                "target": round(target, 2), "box": RENKO_BOX, **_gex_tag(data)})
+                    send_telegram(fmt_entry(METHOD_MARK[1], f"שיטה 1 · #{sid}", d, entry, target, stop,
+                                            "מחיר שוק"))
                     changed = True
         state["dirs"] = dirs
         changed = True
@@ -4906,162 +4957,89 @@ def update_indicator_weights(data):
 # דוח יומי
 # ============================================================
 def send_daily_report(data):
+    """3.17.0: דוח יומי לפי השיטות שרצות בפועל (1, 4A, 4C, 2, 3-6H) — הכל בש"ח לפי גודל פוזיציה.
+    הוסרו: שיטה 1 הישנה (ציונים), 'עיני המערכת', ו-all_time_stats (שהציג את שיטה 2 פעמיים)."""
     today = get_today_key()
-    daily = data["daily_stats"].get(today, {})
-    stats = data["all_time_stats"]
-    signals_today = daily.get("signals_sent", 0)
-    entered_today = daily.get("entered", 0)
-    pnl_today = daily.get("pnl", 0)
-    win_rate = round(stats["wins"] / stats["total_trades"] * 100) if stats["total_trades"] > 0 else 0
-    total_pnl = round(stats.get("total_pnl", 0), 2)
     storage_note = "" if _storage_source == "gist" else "\n⚠️ אחסון זמני בלבד — הנתונים לא ב-Gist!"
 
-    # 3.4: מסלול הסימולציה — כל מה שהמערכת ראתה היום
-    shadows_today = [s for s in data.get("shadow_trades", [])
-                     if s.get("status") == "closed" and s.get("close_time", "").startswith(today)]
-    sh_wins = sum(1 for s in shadows_today if s["result"] == "win")
-    sh_losses = sum(1 for s in shadows_today if s["result"] == "loss")
-    sh_touts = sum(1 for s in shadows_today if s["result"] == "timeout")
-    sh_pnl = round(sum(s.get("pnl", 0) for s in shadows_today), 2)
-    sh_open = sum(1 for s in data.get("shadow_trades", []) if s.get("status") == "open")
-    blocked = daily.get("blocked", {})
-    blocked_txt = ""
-    if blocked:
-        blocked_txt = "🚫 נחסמו תפעולית: " + " | ".join(f"{k}: {v}" for k, v in blocked.items()) + "\n"
-    skipped = daily.get("skipped", 0)
+    def _block(mark, title, rows, open_rows):
+        closed = [r for r in rows if r.get("status") == "closed" and r.get("pnl") is not None]
+        today_c = [r for r in closed if str(r.get("close_time", "")).startswith(today)]
+        txt = f"{mark} <b>{title}</b>\n"
+        if today_c:
+            w = sum(1 for r in today_c if r["pnl"] > 0)
+            txt += (f"היום:    {len(today_c)} עסקאות · {w} זכיות · "
+                    f"{_ils(sum(r['pnl'] for r in today_c)):+.0f} ש\"ח\n")
+        else:
+            txt += "היום:    אין עסקאות סגורות\n"
+        for r in open_rows:
+            txt += f"פתוחה:   {r.get('direction')} {r.get('entry')} · סטופ {r.get('stop')} · יעד {r.get('target')}\n"
+        if closed:
+            w = sum(1 for r in closed if r["pnl"] > 0)
+            txt += (f"מצטבר:  {len(closed)} עסקאות · {100 * w / len(closed):.0f}% · "
+                    f"{_ils(sum(r['pnl'] for r in closed)):+.0f} ש\"ח\n")
+        return txt
 
-    shadow_section = (
-        f"\n👁️ <b>עיני המערכת (סימולציה, בלי מגבלות):</b>\n"
-        f"נסגרו היום: {len(shadows_today)} | ✅ {sh_wins} | ❌ {sh_losses}"
-        + (f" | ⏰ {sh_touts}" if sh_touts else "")
-        + (f" | פתוחות: {sh_open}" if sh_open else "") + "\n"
-        f"💰 {sh_pnl} ש\"ח\n"
-        f"{blocked_txt}"
-        + (f"👋 דילגת על: {skipped}\n" if skipped else "")
-    ) if (shadows_today or sh_open or blocked or skipped) else ""
-
-    # ── 3.9.1: שיטה 2 — הדוח היה עיוור אליה לגמרי ────────────────
-    # עד כאן הדוח קרא רק signals_sent/entered/pnl/shadow_trades, שכולם
-    # שייכים לשיטה 1. שיטה 2 היא היחידה שחיה עם כפתורים — והיא לא הופיעה.
-    s2_open = [t for t in data.get("trades", [])
-               if t.get("system") == 2 and t.get("status") == "open"]
-    s2_closed_today = [t for t in data.get("trades", [])
-                       if t.get("system") == 2 and t.get("status") == "closed"
-                       and str(t.get("close_time", "")).startswith(today)]
-    s2_pending = {k: v for k, v in data.get("pending", {}).items()
-                  if v.get("system") == 2}
-    s2_shadow_open = [s for s in data.get("slow_shadow", [])
-                      if s.get("status") == "open"]
-
-    s2 = f"\n{METHOD_MARK[2]} <b>שיטה 2 (דונקיאן {SLOW_ENTRY_DAYS}/{SLOW_TRAIL_DAYS}):</b>\n"
-    if s2_open:
-        for t in s2_open:
-            units = t.get("units", [{"e": t.get("entry")}])
-            oz = len(units) * SLOW_LOT_OZ
-            # 3.9.3: היה t["time"] — מפתח שלא קיים ברשומת עסקה (רק
-            # ב-pending). ה-except בלע את ה-KeyError והמימון הוצג
-            # כ-0 בכל דוח, תמיד.
-            days = slow_held_days(t)
-            s2 += (f"📍 פתוחה: {t.get('direction')} @{t.get('entry')} | "
-                   f"{len(units)} יח' ({oz:.2f} אונקיות)\n"
-                   f"🛑 סטופ נגרר: {t.get('stop')}"
-                   + (" (ברייקאיבן פעיל)" if t.get("be_hit") else "") + "\n"
-                   f"⏳ מוחזקת {days:.1f} ימים | "
-                   f"💸 מימון מצטבר: {funding_cost_ils(oz, days):.1f}- ש\"ח\n")
-            if t.get("add_trigger") and len(units) < SLOW_PYRAMID_UNITS:
-                s2 += f"🪜 טריגר ליחידה הבאה: {t['add_trigger']}\n"
-    elif s2_pending:
-        s2 += f"⏳ איתות ממתין לאישור: {len(s2_pending)}\n"
+    # גמא
+    g = data.get("gex_now")
+    if g:
+        gex = (f"גמא:  {'שלילית' if g.get('regime') == 'negative' else 'חיובית'} · "
+               f"GLD {g.get('spot')} · קו היפוך {g.get('flip')} · {g.get('as_of') or g.get('date')}\n")
     else:
-        s2 += "😴 אין פוזיציה ואין איתות ממתין.\n"
-    if s2_closed_today:
-        s2 += (f"🔚 נסגרו היום: {len(s2_closed_today)} | "
-               f"{round(sum(t.get('pnl', 0) for t in s2_closed_today), 2)} ש\"ח\n")
-    if s2_shadow_open:
-        sh = s2_shadow_open[0]
-        s2 += (f"👁️ צל: {sh.get('direction')} @{sh.get('entry')} | "
-               f"סטופ {sh.get('stop')}\n")
+        gex = "גמא:  אין נתון עדיין\n"
 
-    # ── 3.9.1: שיטה 3 — איתותי 4H/6H מ-tf_signals ────────────────
-    # 3.9.4 · תיקון 2: עד 3.9.3 השורה סיננה לפי תאריך בלבד, בלי
-    # status — ואיתות שהסטופ שלו כבר נפגע הוצג כטרי, עם סטופ ויעד,
-    # בלי שום סימן. ובנוסף לא הייתה שורת "נסגרו היום" לשיטה 3
-    # (לשיטה 2 יש), ולכן תצפיות ה-forward test לא הופיעו בדוח כלל.
-    tf_all = data.get("tf_signals", [])
-    tf_today = [s for s in tf_all if str(s.get("time", "")).startswith(today)]
-    tf_closed_today = [s for s in tf_all
-                       if s.get("status") == "closed"
-                       and str(s.get("close_time", "")).startswith(today)]
-    _ST = {"open": "🟡 פתוח", "closed": "", "void": "⬛ בוטל",
-           "unresolved": "⬜ לא הוכרע"}
-    s3 = f"\n{METHOD_MARK[3]} <b>שיטה 3 (מעקב בלבד):</b>\n"
-    if tf_today:
-        for s in tf_today:
-            st = s.get("status", "open")
-            if st == "closed":
-                tag = (f"🎯 יעד {s.get('pnl', 0):+.0f} ש\"ח"
-                       if s.get("result") == "win"
-                       else f"🛑 סטופ {s.get('pnl', 0):+.0f} ש\"ח")
-            else:
-                tag = _ST.get(st, st)
-            mark = ""
-            if s.get("tf") == "4H":
-                mark = (" ✅גיבוי" if s.get("backup") is True
-                        else " ⚠️בלי גיבוי" if s.get("backup") is False else "")
-            s3 += (f"{fmt_sig_id(s.get('id'))} {s.get('tf')} "
-                   f"{s.get('direction')} @{s.get('entry')} | "
-                   f"סטופ {s.get('stop')} | יעד {s.get('target')}"
-                   f"{mark} | {tag}\n")
-        n_no = sum(1 for s in tf_today
-                   if s.get("tf") == "4H" and s.get("backup") is False)
-        if n_no:
-            s3 += f"⚠️ {n_no} איתותי 4H בלי גיבוי 6H — הקבוצה המפסידה.\n"
-    else:
-        s3 += "אין איתותים חדשים היום.\n"
-    if tf_closed_today:
-        s3 += (f"🔚 נסגרו היום: {len(tf_closed_today)} | "
-               f"{round(sum(s.get('pnl', 0) for s in tf_closed_today), 2)} ש\"ח\n")
-    # 3.9.4 · תיקון 8: היה min(len,60) בתחפושת של "סה"כ ביומן".
-    s3 += f"📚 סה\"כ איתותים ביומן: {len(tf_all)}\n"
+    # שיטה 1 (Renko, מחיר אמיתי)
+    r1 = [r for r in data.get("renko_signals", []) if r.get("acct") == "real"]
+    b1 = _block(METHOD_MARK[1], "שיטה 1 · Renko 3$", r1, [r for r in r1 if r.get("status") == "open"])
+    # 4A (טווח אסייתי)
+    ra = data.get("asia_signals", [])
+    b4a = _block(METHOD_MARK[4], "שיטה 4A · טווח אסייתי", ra, [r for r in ra if r.get("status") == "open"])
+    # 4C
+    rc = [r for r in data.get("m4v_signals", []) if r.get("variant") == "C"]
+    b4c = _block(METHOD_MARK[4], "שיטה 4C · Renko לפי ATR", rc, [r for r in rc if r.get("status") == "open"])
 
-    # 3.9.4 · תיקון 3: השורה הזאת קראה all_time_stats בלבד — שיטה 1.
-    # tf_monitor לא נוגעת ב-all_time_stats, ולכן שיטה 3 לא נספרה
-    # מעולם. הכותרת הכריזה "1 עסקה · 100% · 41.2 ש"ח" בזמן ש-11
-    # עסקאות אחרות היו סגורות ביומן. עכשיו כל שיטה מוצגת בנפרד,
-    # בלי לערבב סקאלות.
-    tf_done = [s for s in data.get("tf_signals", [])
-               if s.get("status") == "closed"]
-    s2_done = [t for t in data.get("trades", [])
-               if t.get("system") == 2 and t.get("status") == "closed"]
+    # שיטה 2 (חי, עם כפתורים) — pnl כבר בש"ח
+    s2_all = [t for t in data.get("trades", []) if t.get("system") == 2]
+    s2_open = [t for t in s2_all if t.get("status") == "open"]
+    s2_closed = [t for t in s2_all if t.get("status") == "closed"]
+    s2_today = [t for t in s2_closed if str(t.get("close_time", "")).startswith(today)]
+    b2 = f"{METHOD_MARK[2]} <b>שיטה 2 · דונקיאן {SLOW_ENTRY_DAYS}/{SLOW_TRAIL_DAYS}</b>\n"
+    b2 += (f"היום:    {len(s2_today)} עסקאות · {sum(t.get('pnl', 0) for t in s2_today):+.0f} ש\"ח\n"
+           if s2_today else "היום:    אין עסקאות סגורות\n")
+    for t in s2_open:
+        units = t.get("units", [{"e": t.get("entry")}])
+        oz = len(units) * SLOW_LOT_OZ
+        days = slow_held_days(t)
+        b2 += (f"פתוחה:   {t.get('direction')} {t.get('entry')} · סטופ נגרר {t.get('stop')}"
+               + (" (ברייקאיבן)" if t.get("be_hit") else "")
+               + f" · {len(units)} יח' · מימון {funding_cost_ils(oz, days):.0f}- ש\"ח\n")
+    if not s2_open and any(v.get("system") == 2 for v in data.get("pending", {}).values()):
+        b2 += "ממתין:   איתות ממתין לאישור\n"
+    if s2_closed:
+        w = sum(1 for t in s2_closed if t.get("pnl", 0) > 0)
+        b2 += (f"מצטבר:  {len(s2_closed)} עסקאות · {100 * w / len(s2_closed):.0f}% · "
+               f"{sum(t.get('pnl', 0) for t in s2_closed):+.0f} ש\"ח\n")
 
-    def _line(mark, label, rows, note=""):
-        if not rows:
-            return f"{mark} {label}: אין עסקאות סגורות{note}\n"
-        w = sum(1 for r in rows
-                if (r.get("result") == "win" or r.get("pnl", 0) > 0))
-        tot = round(sum(r.get("pnl", 0) for r in rows), 2)
-        return (f"{mark} {label}: {len(rows)} סגורות · "
-                f"{100*w/len(rows):.0f}% · {tot:+.0f} ש\"ח{note}\n")
-
-    summary = (
-        f"{METHOD_MARK[1]} שיטה 1 <i>(מושתקת)</i>: "
-        f"{stats['total_trades']} סגורות · {win_rate}% · {total_pnl} ש\"ח\n"
-        f"{_line(METHOD_MARK[2], 'שיטה 2', s2_done)}"
-        f"{_line(METHOD_MARK[3], 'שיטה 3', tf_done)}"
-    )
+    # שיטה 3 — רק 6H, ורק מאז תיקון ה-ATR (3.12.0, 24/09/2026). pnl כבר בש"ח.
+    tf6 = [x for x in data.get("tf_signals", []) if x.get("tf") == "6H" and str(x.get("time", "")) >= "2026-09-24"]
+    tf_closed = [x for x in tf6 if x.get("status") == "closed"]
+    tf_today = [x for x in tf_closed if str(x.get("close_time", "")).startswith(today)]
+    b3 = f"{METHOD_MARK[3]} <b>שיטה 3 · 6H</b> (מאז 24/09)\n"
+    b3 += (f"היום:    {len(tf_today)} עסקאות · {sum(x.get('pnl', 0) for x in tf_today):+.0f} ש\"ח\n"
+           if tf_today else "היום:    אין עסקאות סגורות\n")
+    for x in tf6:
+        if x.get("status") == "open":
+            b3 += f"פתוחה:   {x.get('direction')} {x.get('entry')} · סטופ {x.get('stop')} · יעד {x.get('target')}\n"
+    if tf_closed:
+        w = sum(1 for x in tf_closed if x.get("result") == "win" or x.get("pnl", 0) > 0)
+        b3 += (f"מצטבר:  {len(tf_closed)} עסקאות · {100 * w / len(tf_closed):.0f}% · "
+               f"{sum(x.get('pnl', 0) for x in tf_closed):+.0f} ש\"ח\n")
 
     send_telegram(
-        f"📊 <b>דוח יומי — {today}</b> · v{BOT_VERSION}\n\n"
-        f"{METHOD_MARK[1]} <b>שיטה 1 (מעקב בלבד) + התיק שלך:</b>\n"
-        f"🔔 איתותים שנשלחו: {signals_today}\n"
-        f"✅ עסקאות שנכנסת: {entered_today}\n"
-        f"💰 רווח/הפסד היום: {round(pnl_today, 2)} ש\"ח\n"
-        f"{shadow_section}"
-        f"{s2}"
-        f"{s3}\n"
-        f"📈 <b>מצטבר לפי שיטה</b>\n"
-        f"{summary}"
-        f"<i>שיטה 1 בסקאלה ישנה — לא לחבר בין השורות.</i>"
+        f"📊 <b>דוח יומי · {today}</b> · v{BOT_VERSION}\n"
+        f"{gex}\n"
+        f"{b1}\n{b4a}\n{b4c}\n{b2}\n{b3}"
+        f"<i>מעקב בלבד חוץ משיטה 2. סכומים בש\"ח לפי {POSITION_SIZE_OZ}oz (שיטה 2: לפי היחידות בפועל).</i>"
         f"{storage_note}"
     )
 
@@ -5158,6 +5136,7 @@ def main():
                                 if M4_ENABLED: m4_scan(data, _h1)
                                 m4v_scan(data, _h1)
                                 asia_scan(data, _h1)
+                                gex_scan(data)
                         except Exception as _e:
                             print(f"[M4] שגיאה: {_e}", flush=True)
                     except Exception as e:
